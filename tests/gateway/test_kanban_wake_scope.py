@@ -218,6 +218,27 @@ def test_wake_scope_id_is_none_for_adapters_without_the_hook():
     assert _wake_scope_id(UnscopedAdapter(), {"chat_id": CHANNEL}) is None
 
 
+def test_discord_legacy_parent_channel_wakes_the_actual_thread(tmp_path, monkeypatch):
+    from gateway.session import SessionSource
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "discord.db"))
+    tid = _completed_subscription(
+        platform="discord", chat_id="parent", thread_id="thread", chat_type="thread", user_id=USER,
+    )
+    adapter = UnscopedAdapter()
+    asyncio.run(_one_notifier_tick(monkeypatch, _runner(adapter, Platform.DISCORD)))
+    inbound = SessionSource(platform=Platform.DISCORD, chat_id="thread", thread_id="thread",
+                            chat_type="thread", user_id=USER)
+    assert build_session_key(adapter.handled[0].source) == build_session_key(inbound)
+    assert adapter.sent[0]["metadata"]["thread_id"] == "thread"
+    # Canonicalizing the wake must not change the subscription key or replay it.
+    asyncio.run(_one_notifier_tick(monkeypatch, _runner(adapter, Platform.DISCORD)))
+    assert len(adapter.sent) == len(adapter.handled) == 1
+    with kbc.connect() as conn:
+        assert kbn.list_notify_subs(conn, tid)[0]["chat_id"] == "parent"
+
+
 def test_slack_adapter_reports_the_channel_workspace():
     adapter = SlackAdapter.__new__(SlackAdapter)
     adapter._channel_team = {CHANNEL: TEAM}

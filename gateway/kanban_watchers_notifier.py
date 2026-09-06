@@ -178,16 +178,32 @@ class _Collector:
             logger.debug("kanban notifier: subscription for %s on %s skipped; adapter not connected",
                          sub.get("task_id"), platform or "<missing>")
             return None
+        metadata = sub.get("delivery_metadata") or {}
+        # Progress delivery is opt-in and passive: comments must never create
+        # agent wake/comment loops or override an explicit wake-only preference.
+        comments_enabled = (
+            isinstance(metadata, dict) and metadata.get("notify_comments") is True
+            and sub.get("delivery_mode") != "wake"
+        )
+        kinds = TERMINAL_KINDS + (("commented",) if comments_enabled else ())
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-            thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
+            thread_id=sub.get("thread_id") or "", kinds=kinds,
         )
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        comments = {}
+        for event in events:
+            comment_id = _payload(event, "comment_id") if event.kind == "commented" else None
+            if isinstance(comment_id, int):
+                comment = self.kb.get_comment(conn, sub["task_id"], comment_id)
+                if comment:
+                    comments[event.id] = comment.body
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+                "task": task, "board": slug, "comments": comments}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -399,6 +415,11 @@ class _KanbanNotification:
 
     def format_event(self, ev: Any) -> Optional[str]:
         """Render one event; accumulates wake handoff/review detail. None → silent kind."""
+        if ev.kind == "commented":
+            # Legacy events have no stable comment id: never guess by timestamp
+            # and accidentally attribute another comment (or task) to this event.
+            body = self.d.get("comments", {}).get(ev.id)
+            return f"ℹ {self.head} update — {self.title}\n{_safe_review_reason(body, 700)}" if body else None
         formatter = _EVENT_FORMATTERS.get(ev.kind)
         if formatter is None:
             return None
@@ -465,8 +486,15 @@ class _KanbanNotification:
             _delivery_meta = sub.get("delivery_metadata")
             if isinstance(_delivery_meta, dict):
                 _chat_type = str(_delivery_meta.get("chat_type") or "").strip()
+        _chat_id = sub["chat_id"]
+        if self.platform_str == "discord" and sub.get("thread_id"):
+            # Discord inbound sources use the thread for BOTH ids. Older
+            # subscriptions stored the parent channel, creating a parallel
+            # conversation on wake. Keep the persisted key for cursor updates.
+            _chat_id = sub["thread_id"]
+            _chat_type = "thread"
         _source = SessionSource(
-            platform=self.plat, chat_id=sub["chat_id"], chat_type=_chat_type or "group",
+            platform=self.plat, chat_id=_chat_id, chat_type=_chat_type or "group",
             thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"), user_id_alt=sub.get("user_id_alt"),
             profile=self.sub_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
         )
