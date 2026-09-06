@@ -2533,11 +2533,29 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _completion_observation_matches(
+    conn: sqlite3.Connection, task_id: str,
+    expected_status: Optional[str], expected_event_id: Optional[int],
+) -> bool:
+    """Reject stale reconciliation before staging and inside the write lock."""
+    if expected_status is not None and _task_status(conn, task_id) != expected_status:
+        return False
+    if expected_event_id is not None:
+        latest = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        if latest != expected_event_id:
+            return False
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    expected_status: Optional[str] = None, expected_event_id: Optional[int] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2549,6 +2567,10 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    if not _completion_observation_matches(
+        conn, task_id, expected_status, expected_event_id,
+    ):
+        return False
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2559,6 +2581,10 @@ def complete_task(
     )
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
+        if not _completion_observation_matches(
+            conn, task_id, expected_status, expected_event_id,
+        ):
+            return False
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
@@ -3181,17 +3207,17 @@ def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     force: bool = False, dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
+    """Operator promotion ``todo``/``blocked``/``ready`` -> ``ready`` with an audit event.
     Refused while a parent is unfinished unless ``force``; ``dry_run`` only
     validates. Returns ``(ok, reason)``."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked", "ready"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked' or 'ready'"
         )
 
     if not force:
@@ -3213,7 +3239,7 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            "WHERE id = ? AND status IN ('todo', 'blocked', 'ready')", (task_id,),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"

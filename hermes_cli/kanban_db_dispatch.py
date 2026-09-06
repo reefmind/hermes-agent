@@ -1122,6 +1122,23 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _has_unclaimed_continuation(conn: sqlite3.Connection, task_id: str) -> bool:
+    """A review finding or explicit operator promotion authorizes ONE claim.
+
+    Event IDs, not timestamps, fence same-second handoffs. A claim consumes
+    the permission even if its worker subsequently crashes or is reclaimed.
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? AND kind IN "
+        "('changes_requested', 'review_reopened', 'promoted_manual', "
+        "'claimed', 'blocked', 'gave_up', 'completed', 'archived') "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    return row is not None and row["kind"] in {
+        "changes_requested", "review_reopened", "promoted_manual",
+    }
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1178,6 +1195,8 @@ def check_respawn_guard(
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
     if lane == "review":
+        return None
+    if _has_unclaimed_continuation(conn, task_id):
         return None
 
     # 3. Completed run within guard window. Exception: an explicit re-queue
