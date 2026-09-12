@@ -39,6 +39,8 @@ def test_reopen_cli_preserves_history_and_regates_once(board, status, parent_pen
         parent = kb.create_task(board, title="unfinished prerequisite", assignee="backend")
         kb.link_tasks(board, parent_id=parent, child_id=tid)
         event = board.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
+    shown = json.loads(cli.run_slash(f"show {tid} --json"))
+    assert max(item["id"] for item in shown["events"]) == event
     command = f'reopen {tid} --expected-status {status} --expected-event-id {event} --assignee backend --reason "Original scope remains"'
     before = dict(board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
     dry = cli.run_slash(command + " --dry-run")
