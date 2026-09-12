@@ -179,6 +179,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
             return _cmd_repair(args)
+        # Reopening must refuse stale ownership, not repair it during auto-init.
+        if action == "reopen":
+            from hermes_cli.kanban_reopen import cmd_reopen
+            return cmd_reopen(args)
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:

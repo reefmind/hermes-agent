@@ -322,6 +322,14 @@ _SPECS = [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
+    _cmd("reopen", [
+        _TASK_ID,
+        _arg("--expected-status", required=True, choices=("review", "done")),
+        _arg("--expected-event-id", required=True, type=int),
+        _arg("--assignee", required=True, help="Explicit implementation owner"),
+        _arg("--reason", required=True, help="Audit reason for unfinished canonical scope"),
+        _arg("--dry-run", action="store_true", help="Validate without changing the card"),
+    ], help="Operator-only fenced reopening of unowned review/done work"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
