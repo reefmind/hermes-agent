@@ -52,22 +52,75 @@ operator terminal CLI for reopening, then verify the existing dispatcher consume
 its standard promotion event. A successful dry run is not permission to restart,
 deploy customer software, merge a PR, or mutate production.
 
-## Returning CI failures and review findings to the same card
+## Routine findings and durable dispatcher reconciliation
 
-Record the failed check or finding, exact head, and remaining scope on the original
-implementation card. If it is still running, steer its current worker; do not reopen
-or launch another. Once unowned in review/done, observe and explicitly reopen that
-same ID using the command above. Preserve the existing independent review card and
-ask its operator to review only the changed delta. Never create a continuation card
-or treat a self-review as independent acceptance. Reuse evidence for unchanged code;
-rerun invalidated checks and require actual hosted success for the new head.
+The supported idle-handoff form no longer calls the legacy active-review-only
+`request_changes` function (which installations may disable). It bypasses database
+initialization and retains all reopening fences, while deriving the implementation
+owner from the card and checking its latest exact-head handoff and existing reviewer:
 
-The immediate transaction plus ordinary claim path grant only one worker ownership.
-This is an explicit operator loop, not automatic CI-webhook recovery. After adoption,
-verify one `canonical_reopened`, one `promoted_manual`, and one subsequent `claimed`
-event/run for that authorization. Implementation completion must still require review.
-A disposable composition probe is evidence of compatibility, not proof that the
-installed gateway, dispatcher, and notification path have all adopted this workflow.
+```sh
+hermes kanban --board <board> request-changes <implementation-id> 'Concrete finding' \
+  --expected-event-id <latest-event-id> --head-sha <40-char-sha> \
+  --review-task-id <existing-review-id>
+```
+
+All three flags are required together. This operator command is not crash recovery:
+worker failure markers, active/stale ownership and downstream dependencies refuse it.
+The original flagless active-review command is unchanged. No worker acquires authority
+to mutate another card, and no reviewer card is created or automatically dispatched.
+
+For routine automation, the existing dispatcher tick consumes opt-in structured
+`canonical_delivery` metadata from the latest normally ended, claimed implementation
+run while the same card is in `review`. This is not a new daemon, supervisor, CI poller
+or webhook. The implementation handoff uses the existing completion metadata channel:
+
+```json
+{
+  "head_sha": "<40-char-lowercase-sha>",
+  "review_task_id": "<existing-review-id>",
+  "canonical_delivery": {
+    "artifact": "<same-PR-URL>",
+    "draft": false,
+    "ci": {"head": "<same-sha>", "status": "success", "action": "hold"},
+    "proof": {"head": "<same-sha>", "status": "passed"}
+  }
+}
+```
+
+The independent reviewer's own normally completed claimed run must acknowledge the
+same artifact and head in its metadata:
+
+```json
+{"head_sha":"<same-sha>","artifact":"<same-PR-URL>","verdict":"PASS","findings":""}
+```
+
+Use `verdict: BLOCK` with concrete nonblank findings to request code changes. A recorded
+CI code failure uses `ci.status: failure` and explicit `ci.action: rework`; approval,
+credential, runner-availability or other operator gates use `action: hold` (the default).
+Never classify missing `ci-reviewed` approval as a code failure. `success` means the
+actual aggregate of all required hosted checks, including required approval gates;
+never manufacture a success receipt from partial green jobs. Receipts are supplied by
+owning runs, not fetched or verified against GitHub by this controller.
+
+With matching completed independent evidence, actionable findings/CI rework return the
+SAME implementation ID and owner to the standard ready queue. Each exact head is consumed
+once, so repeated ticks or identical resubmissions cannot replenish attempts. Changed
+code needs a new head and only the invalidated evidence. Manual reopening remains the
+explicit operator escape for legacy done work or deliberate same-head recovery.
+Missing/stale/malformed evidence stays parked, including with spare dispatch capacity;
+legacy same-card review dispatch cannot accidentally claim an opt-in handoff. Existing
+linked `delivery_review` contracts are not handled by this path or silently converted.
+
+An exact matching independent PASS, required-CI success, non-Draft PR and proof receipt
+emit one `canonical_delivery_ready` event, not a task completion/approval or merge. The
+existing originating subscription renders `Ready PR (not approved or installed)` with
+head and artifact. No subscription is synthesized and no live transport delivery is
+claimed by a disposable notification test. The card remains `review` for Brett.
+
+After operator adoption, verify the actual tick emits one authorization/claim, preserves
+the independent card and contract, and delivers the correct origin notification. A
+fresh CLI smoke alone does NOT prove the long-lived dispatcher/notifier adopted code.
 
 ## Origin notification verification (operator-owned)
 
@@ -95,14 +148,17 @@ or gateway restart is part of this repair.
 
 Brett approval and operator adoption are separate from a technical review PASS.
 Export a runtime-only patch from the reviewed base/head, restricted to
-`hermes_cli/kanban.py`, `hermes_cli/kanban_parser.py`, and
-`hermes_cli/kanban_reopen.py`. Repository CI changes belong in the integration branch,
+`hermes_cli/kanban.py`, `hermes_cli/kanban_parser.py`, `hermes_cli/kanban_reopen.py`,
+`hermes_cli/kanban_findings.py`, `hermes_cli/kanban_db_dispatch.py`, and
+`gateway/kanban_watchers_notifier.py`. Repository CI changes belong in the integration branch,
 not in the live runtime patch. Preserve the installation's current tracked/untracked
 files before adoption; never reset the dirty installation to this PR's base.
 
 ```sh
 git -C <candidate> diff --binary <reviewed-base> <reviewed-head> -- \
-  hermes_cli/kanban.py hermes_cli/kanban_parser.py hermes_cli/kanban_reopen.py > runtime-reopen.patch
+  hermes_cli/kanban.py hermes_cli/kanban_parser.py hermes_cli/kanban_reopen.py \
+  hermes_cli/kanban_findings.py hermes_cli/kanban_db_dispatch.py \
+  gateway/kanban_watchers_notifier.py > runtime-reopen.patch
 git -C <installation> apply --check <absolute-runtime-patch>
 # Operator only, after preservation and approval:
 git -C <installation> apply <absolute-runtime-patch>

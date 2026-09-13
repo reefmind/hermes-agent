@@ -25,7 +25,7 @@ def reopen_task(
         raise ValueError("cannot reopen without actor, reason, and explicit assignee")
     reason = str(kb.redact_review_value(reason.strip()))
     canonical_assignee = kb._canonical_assignee(assignee)
-    with kb.write_txn(conn):
+    with kb.write_txn(conn, allow_nested=True):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         observed = conn.execute(
             "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (task_id,),
