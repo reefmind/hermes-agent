@@ -316,12 +316,24 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
-    _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
-         help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("request-changes", [
+        _TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review"),
+        _arg("--expected-event-id", type=int, help="Fence an idle implementation handoff"),
+        _arg("--head-sha", help="Exact implementation artifact receiving findings"),
+        _arg("--review-task-id", help="Acknowledge the existing independent review card"),
+    ], help="Return findings to the same implementation; fenced flags select idle handoff mode"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
+    _cmd("reopen", [
+        _TASK_ID,
+        _arg("--expected-status", required=True, choices=("review", "done")),
+        _arg("--expected-event-id", required=True, type=int),
+        _arg("--assignee", required=True, help="Explicit implementation owner"),
+        _arg("--reason", required=True, help="Audit reason for unfinished canonical scope"),
+        _arg("--dry-run", action="store_true", help="Validate without changing the card"),
+    ], help="Operator-only fenced reopening of unowned review/done work"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),

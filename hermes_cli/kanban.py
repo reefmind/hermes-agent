@@ -179,6 +179,16 @@ def kanban_command(args: argparse.Namespace) -> int:
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
             return _cmd_repair(args)
+        # Reopening must refuse stale ownership, not repair it during auto-init.
+        if action == "reopen":
+            from hermes_cli.kanban_reopen import cmd_reopen
+            return cmd_reopen(args)
+        if action == "request-changes" and any(
+            getattr(args, name, None) is not None
+            for name in ("expected_event_id", "head_sha", "review_task_id")
+        ):
+            from hermes_cli.kanban_findings import cmd_request_changes
+            return cmd_request_changes(args)
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
@@ -487,7 +497,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         _print_json({
             "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
-            "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+            "events": [_obj_dict(e, ("id", "kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
         })
         return 0
