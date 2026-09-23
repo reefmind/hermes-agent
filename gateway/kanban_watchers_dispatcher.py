@@ -182,6 +182,45 @@ class _KanbanDispatcher:
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        # Brett, 2026-09-04/06 (re-anchored after the upstream split):
+        # ``max_spawn_per_board`` caps how many host slots one board may hold;
+        # ``reserved_slots`` keeps N slots for a board WHENEVER it has spawnable
+        # ready work, so other boards cannot take the last slot while it waits.
+        # Costs nothing while the reserved board is idle.
+        try:
+            from hermes_cli.config import load_config_readonly
+            kcfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+            per_board = {}
+            for _s, _c in (kcfg.get("max_spawn_per_board") or {}).items():
+                try: per_board[str(_s).strip()] = int(_c)
+                except (TypeError, ValueError): pass
+            reserved = {}
+            for _s, _n in (kcfg.get("reserved_slots") or {}).items():
+                try: reserved[str(_s).strip()] = max(0, int(_n))
+                except (TypeError, ValueError): pass
+            if slug in per_board:
+                cap = per_board[slug]
+                cur = kwargs.get("max_spawn")
+                kwargs["max_spawn"] = cap if cur is None else min(int(cur), cap)
+            held = 0
+            for r_slug, r_n in reserved.items():
+                if r_slug == slug or r_n <= 0:
+                    continue
+                rconn = None
+                try:
+                    rconn = _kbc().connect(board=r_slug)
+                    if _kbd().has_spawnable_ready(rconn) if hasattr(_kbd(), "has_spawnable_ready") else False:
+                        held += max(0, r_n - _kbd().count_running_tasks(rconn))
+                except Exception:
+                    pass
+                finally:
+                    if rconn is not None:
+                        with contextlib.suppress(Exception):
+                            rconn.close()
+            if held and kwargs.get("max_in_progress") is not None:
+                kwargs["max_in_progress"] = max(0, int(kwargs["max_in_progress"]) - held)
+        except Exception:
+            logger.exception("kanban dispatcher: board routing config ignored for %s", slug)
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
@@ -236,6 +275,12 @@ class _KanbanDispatcher:
         return False
 
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
+        # ONE-CARD: auto-decompose disabled (2026-09-08). It is the only thing
+        # left that manufactures a parent/child workgraph, which is exactly the
+        # structure this redesign removed. A triage card is specified in place.
+        return 0
+
+    def _legacy_auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
         """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
 
         Runs before dispatch fans out; the per-tick cap keeps a bulk triage

@@ -70,6 +70,20 @@ def _claimed_review(
     return task_id, review
 
 
+def test_retained_operator_review_cap_stays_parked(conn, monkeypatch):
+    monkeypatch.setattr(kb, "_REVIEW_CYCLE_CAP", 1)
+    task_id, review = _claimed_review(conn, "Bounded review")
+    ok, implementer = kb.request_changes(
+        conn, task_id, reason="Needs correction", expected_run_id=review.current_run_id,
+    )
+    assert ok and implementer == "builder"
+    for _ in range(2):
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, task_id).status == "blocked"
+    event = _event(kb.list_events(conn, task_id), "blocked")
+    assert event.payload["kind"] == "needs_input"
+
+
 def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
     task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
@@ -502,7 +516,13 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
     assert crashed_id in kbd.detect_crashed_workers(conn)
     crashed = kb.get_task(conn, crashed_id)
     assert crashed is not None
-    assert crashed.status == "review"
+    assert crashed.status == "blocked"
+    crash_event = next(
+        event for event in reversed(kb.list_events(conn, crashed_id))
+        if event.kind == "crashed"
+    )
+    assert crash_event.payload["operator_held"] is True
+    assert crash_event.payload["retry_status"] == "review"
 
 
 def test_goal_run_status_is_bound_to_original_run(conn) -> None:
@@ -564,6 +584,598 @@ def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -
         "source_status": "review",
         "approval": "manual",
     }
+
+
+def test_completed_implementation_releases_one_declared_review_child(conn) -> None:
+    implementation_id = kb.create_task(
+        conn, title="Implement durable notices", assignee="builder"
+    )
+    review_id = kb.create_task(
+        conn,
+        title="Independently review durable notices",
+        assignee="reviewer",
+        parents=[implementation_id],
+        created_by="builder",
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="implementation and focused tests complete",
+        created_cards=[review_id],
+        expected_run_id=implementation.current_run_id,
+    )
+
+    completed = _event(kb.list_events(conn, implementation_id), "completed")
+    assert completed.payload["verified_cards"] == [review_id]
+    assert completed.payload["completion_kind"] == "final"
+    assert not any(
+        event.kind == "review_requested"
+        for event in kb.list_events(conn, implementation_id)
+    )
+    review = kb.get_task(conn, review_id)
+    assert review is not None
+    assert review.status == "ready"
+    assert len(kb.list_tasks(conn)) == 2
+
+
+def test_required_review_without_child_parks_actionable_handoff_once(conn) -> None:
+    implementation_id = kb.create_task(
+        conn,
+        title="Implement durable notices",
+        assignee="builder",
+        review_requirement={"required": True, "owner": "techlead"},
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="implementation and focused tests complete",
+        expected_run_id=implementation.current_run_id,
+    )
+
+    parked = kb.get_task(conn, implementation_id)
+    assert parked is not None
+    assert parked.status == "review"
+    assert parked.assignee is None
+    handoffs = [
+        event
+        for event in kb.list_events(conn, implementation_id)
+        if event.kind == "review_handoff_required"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0].payload == {
+        "completion_kind": "implementation_ready_for_review",
+        "implementer": "builder",
+        "owner": "techlead",
+        "ready": False,
+        "review_task_id": None,
+        "summary": "implementation and focused tests complete",
+    }
+    assert not any(
+        event.kind == "completed"
+        for event in kb.list_events(conn, implementation_id)
+    )
+
+    assert not kb.complete_task(
+        conn,
+        implementation_id,
+        summary="replayed implementation handoff",
+        expected_run_id=implementation.current_run_id,
+    )
+    assert len(
+        [
+            event
+            for event in kb.list_events(conn, implementation_id)
+            if event.kind == "review_handoff_required"
+        ]
+    ) == 1
+
+
+def test_required_review_releases_only_canonical_independent_child(conn) -> None:
+    implementation_id = kb.create_task(
+        conn,
+        title="Implement durable notices",
+        assignee="builder",
+        review_requirement={"required": True, "owner": "techlead"},
+    )
+    unrelated_id = kb.create_task(
+        conn,
+        title="Publish release notes",
+        assignee="publisher",
+        parents=[implementation_id],
+    )
+    review_id = kb.create_task(
+        conn,
+        title="Independently review durable notices",
+        assignee="reviewer",
+        parents=[implementation_id],
+        created_by="techlead",
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="implementation ready",
+        metadata={
+            "review_requirement": {
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": review_id,
+            }
+        },
+        expected_run_id=implementation.current_run_id,
+    )
+
+    completed = _event(kb.list_events(conn, implementation_id), "completed")
+    assert completed.payload["completion_kind"] == "implementation_ready_for_review"
+    assert completed.payload["review_handoff"] == {
+        "owner": "techlead",
+        "ready": False,
+        "review_task_id": review_id,
+    }
+    assert kb.get_task(conn, review_id).status == "ready"
+    assert kb.get_task(conn, unrelated_id).status == "ready"
+
+    review = kb.claim_task(conn, review_id, claimer="reviewer:1")
+    assert review is not None
+    assert kb.complete_task(
+        conn,
+        review_id,
+        summary="independent review approved",
+        expected_run_id=review.current_run_id,
+    )
+    approval = _event(kb.list_events(conn, review_id), "completed")
+    assert approval.payload["completion_kind"] == "review_approved"
+    assert approval.payload["review_handoff"] == {
+        "implementation_task_id": implementation_id,
+        "owner": "techlead",
+    }
+
+
+def test_creation_can_bind_and_gate_precreated_canonical_review(conn) -> None:
+    review_id = kb.create_task(
+        conn, title="Review export", assignee="reviewer", created_by="techlead"
+    )
+    implementation_id = kb.create_task(
+        conn,
+        title="Implement export",
+        assignee="builder",
+        review_requirement={
+            "required": True,
+            "owner": "techlead",
+            "review_task_id": review_id,
+        },
+    )
+    assert kb.child_ids(conn, implementation_id) == [review_id]
+    assert kb.get_task(conn, review_id).status == "todo"
+
+
+def test_creation_rejects_stale_or_non_independent_canonical_review(conn) -> None:
+    self_review_id = kb.create_task(conn, title="Self review", assignee="builder")
+    with pytest.raises(ValueError, match="independent reviewer"):
+        kb.create_task(
+            conn,
+            title="Implement export",
+            assignee="builder",
+            review_requirement={
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": self_review_id,
+            },
+        )
+
+
+def test_creation_rejects_canonical_cycle_and_active_child(conn) -> None:
+    review_id = kb.create_task(conn, title="Review export", assignee="reviewer")
+    with pytest.raises(ValueError, match="cycle"):
+        kb.create_task(
+            conn,
+            title="Implement export",
+            assignee="builder",
+            parents=[review_id],
+            review_requirement={
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": review_id,
+            },
+        )
+
+    active = kb.claim_task(conn, review_id, claimer="reviewer:active")
+    assert active is not None
+    with pytest.raises(ValueError, match="already active"):
+        kb.create_task(
+            conn,
+            title="Second implementation",
+            assignee="builder",
+            review_requirement={
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": review_id,
+            },
+        )
+
+
+def test_canonical_review_child_cannot_bind_two_contracts_at_creation(conn) -> None:
+    review_id = kb.create_task(conn, title="Shared review", assignee="reviewer")
+    first_id = kb.create_task(
+        conn,
+        title="First implementation",
+        assignee="builder-one",
+        review_requirement={
+            "required": True,
+            "owner": "techlead",
+            "review_task_id": review_id,
+        },
+    )
+    with pytest.raises(ValueError, match="already canonically bound"):
+        kb.create_task(
+            conn,
+            title="Second implementation",
+            assignee="builder-two",
+            review_requirement={
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": review_id,
+            },
+        )
+    assert kb.child_ids(conn, first_id) == [review_id]
+
+
+def test_canonical_review_child_cannot_bind_two_contracts_at_completion(conn) -> None:
+    first_id = kb.create_task(conn, title="First implementation", assignee="builder-one")
+    second_id = kb.create_task(conn, title="Second implementation", assignee="builder-two")
+    review_id = kb.create_task(
+        conn,
+        title="Shared review",
+        assignee="reviewer",
+        parents=[first_id, second_id],
+    )
+    first = kb.claim_task(conn, first_id, claimer="builder-one:1")
+    second = kb.claim_task(conn, second_id, claimer="builder-two:1")
+    assert first is not None and second is not None
+    contract = {
+        "required": True,
+        "owner": "techlead",
+        "review_task_id": review_id,
+    }
+    assert kb.complete_task(
+        conn,
+        first_id,
+        summary="first ready",
+        metadata={"review_requirement": contract},
+        expected_run_id=first.current_run_id,
+    )
+    with pytest.raises(ValueError, match="already canonically bound"):
+        kb.complete_task(
+            conn,
+            second_id,
+            summary="second ready",
+            metadata={"review_requirement": contract},
+            expected_run_id=second.current_run_id,
+        )
+
+
+def test_parked_contract_uses_original_implementer_after_reassignment(conn) -> None:
+    implementation_id = kb.create_task(
+        conn,
+        title="Implement export",
+        assignee="builder",
+        review_requirement={"required": True, "owner": "techlead"},
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="implementation ready",
+        expected_run_id=implementation.current_run_id,
+    )
+    assert kb.assign_task(conn, implementation_id, "techlead")
+    self_review_id = kb.create_task(
+        conn,
+        title="Review export",
+        assignee="builder",
+        parents=[implementation_id],
+    )
+    with pytest.raises(ValueError, match="independent reviewer"):
+        kb.complete_task(
+            conn,
+            implementation_id,
+            summary="review attached",
+            metadata={
+                "review_requirement": {
+                    "required": True,
+                    "owner": "techlead",
+                    "review_task_id": self_review_id,
+                }
+            },
+        )
+
+
+def test_parked_handoff_honors_disabled_lifecycle_hook(conn, monkeypatch) -> None:
+    task_id = kb.create_task(
+        conn,
+        title="Implement export",
+        assignee="builder",
+        review_requirement={"required": True, "owner": "techlead"},
+    )
+    task = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert task is not None
+    fired = []
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lambda *a, **k: fired.append((a, k)))
+    assert kb.complete_task(
+        conn,
+        task_id,
+        summary="implementation ready",
+        expected_run_id=task.current_run_id,
+        fire_lifecycle_hook=False,
+    )
+    assert fired == []
+    with pytest.raises(ValueError, match="does not exist"):
+        kb.create_task(
+            conn,
+            title="Implement export",
+            assignee="builder",
+            review_requirement={
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": "t_deadbeef",
+            },
+        )
+
+
+def test_parked_required_review_can_attach_child_without_rerunning(conn) -> None:
+    implementation_id = kb.create_task(
+        conn,
+        title="Implement export",
+        assignee="builder",
+        review_requirement={"required": True, "owner": "techlead"},
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="implementation ready",
+        expected_run_id=implementation.current_run_id,
+    )
+    review_id = kb.create_task(
+        conn,
+        title="Review export",
+        assignee="reviewer",
+        parents=[implementation_id],
+        created_by="techlead",
+        idempotency_key=f"review:{implementation_id}",
+    )
+    assert review_id == kb.create_task(
+        conn,
+        title="Review export replay",
+        assignee="reviewer",
+        parents=[implementation_id],
+        created_by="techlead",
+        idempotency_key=f"review:{implementation_id}",
+    )
+
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="canonical review attached",
+        metadata={
+            "review_requirement": {
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": review_id,
+            }
+        },
+    )
+    assert kb.get_task(conn, implementation_id).status == "done"
+    assert kb.get_task(conn, review_id).status == "ready"
+
+
+@pytest.mark.parametrize(
+    "requirement, message",
+    [
+        ({"required": "yes", "owner": "techlead"}, "required must be a boolean"),
+        ({"required": True}, "owner is required"),
+        ({"required": False, "owner": "techlead"}, "required must be true"),
+    ],
+)
+def test_review_requirement_shape_is_validated(conn, requirement, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        kb.create_task(
+            conn,
+            title="Invalid contract",
+            assignee="builder",
+            review_requirement=requirement,
+        )
+
+
+def test_required_review_rejects_stale_non_dependency_and_implementer_bindings(conn) -> None:
+    implementation_id = kb.create_task(
+        conn,
+        title="Implement export",
+        assignee="builder",
+        review_requirement={"required": True, "owner": "techlead"},
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+
+    for review_task_id in ("t_deadbeef", kb.create_task(
+        conn, title="Unlinked review", assignee="reviewer"
+    )):
+        with pytest.raises(ValueError):
+            kb.complete_task(
+                conn,
+                implementation_id,
+                summary="implementation ready",
+                metadata={
+                    "review_requirement": {
+                        "required": True,
+                        "owner": "techlead",
+                        "review_task_id": review_task_id,
+                    }
+                },
+                expected_run_id=implementation.current_run_id,
+            )
+
+    same_reviewer_id = kb.create_task(
+        conn,
+        title="Self review",
+        assignee="builder",
+        parents=[implementation_id],
+    )
+    with pytest.raises(ValueError, match="independent reviewer"):
+        kb.complete_task(
+            conn,
+            implementation_id,
+            summary="implementation ready",
+            metadata={
+                "review_requirement": {
+                    "required": True,
+                    "owner": "techlead",
+                    "review_task_id": same_reviewer_id,
+                }
+            },
+            expected_run_id=implementation.current_run_id,
+        )
+
+
+def test_required_review_contract_cannot_be_downgraded_or_rebound(conn) -> None:
+    implementation_id = kb.create_task(
+        conn,
+        title="Implement export",
+        assignee="builder",
+        review_requirement={"required": True, "owner": "techlead"},
+    )
+    first_review_id = kb.create_task(
+        conn, title="Review export", assignee="reviewer", parents=[implementation_id]
+    )
+    second_review_id = kb.create_task(
+        conn, title="Review export again", assignee="reviewer", parents=[implementation_id]
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="implementation ready",
+        metadata={
+            "review_requirement": {
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": first_review_id,
+            }
+        },
+        expected_run_id=implementation.current_run_id,
+    )
+    with pytest.raises(ValueError, match="cannot rebind"):
+        kb.complete_task(
+            conn,
+            implementation_id,
+            summary="rebind",
+            metadata={
+                "review_requirement": {
+                    "required": True,
+                    "owner": "techlead",
+                    "review_task_id": second_review_id,
+                }
+            },
+        )
+    with pytest.raises(ValueError, match="must be true"):
+        kb.complete_task(
+            conn,
+            implementation_id,
+            summary="downgrade",
+            metadata={
+                "review_requirement": {
+                    "required": False,
+                    "owner": "techlead",
+                }
+            },
+        )
+    assert kb.get_task(conn, implementation_id).review_requirement["review_task_id"] == first_review_id
+
+
+def test_prose_pr_and_arbitrary_child_do_not_establish_review_acceptance(conn) -> None:
+    implementation_id = kb.create_task(
+        conn, title="Implement durable notices", assignee="builder"
+    )
+    release_id = kb.create_task(
+        conn,
+        title="Publish release notes",
+        assignee="publisher",
+        parents=[implementation_id],
+        created_by="someone-else",
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+    kb.add_comment(
+        conn,
+        implementation_id,
+        "builder",
+        "Review ready; PR OPEN: https://github.com/example/repo/pull/123",
+    )
+
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="review-required: PR is OPEN and non-Draft",
+        expected_run_id=implementation.current_run_id,
+    )
+
+    completed = _event(kb.list_events(conn, implementation_id), "completed")
+    assert completed.payload["completion_kind"] == "final"
+    assert completed.payload["source_status"] != "review"
+    assert "verified_cards" not in completed.payload
+    assert not any(
+        event.kind == "review_requested"
+        for event in kb.list_events(conn, implementation_id)
+    )
+    assert kb.get_task(conn, release_id).status == "ready"
+
+
+def test_orphan_reconciler_cannot_treat_pr_prose_as_completion(conn) -> None:
+    implementation_id = kb.create_task(
+        conn, title="Implement durable notices", assignee="builder"
+    )
+    review_id = kb.create_task(
+        conn,
+        title="Independent review",
+        assignee="reviewer",
+        parents=[implementation_id],
+        created_by="builder",
+    )
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert implementation is not None
+    kb.add_comment(
+        conn,
+        implementation_id,
+        "builder",
+        "Implementation complete, review requested, PR OPEN/non-Draft.",
+    )
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, worker_pid = NULL WHERE id = ?",
+            (implementation_id,),
+        )
+
+    assert kb.reconcile_orphaned_running(conn) == [implementation_id]
+
+    implementation = kb.get_task(conn, implementation_id)
+    review = kb.get_task(conn, review_id)
+    assert implementation is not None and implementation.status == "ready"
+    assert review is not None and review.status == "todo"
+    assert not any(
+        event.kind in {"completed", "review_requested"}
+        for event in kb.list_events(conn, implementation_id)
+    )
 
 
 def test_legacy_review_child_deadlock_is_reported_immediately(conn):
@@ -650,6 +1262,60 @@ def _failures(conn, task_id: str) -> int:
     return int(conn.execute(
         "SELECT consecutive_failures FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()[0])
+
+
+@pytest.mark.parametrize("surface", ["cli", "dashboard"])
+def test_review_reopen_preserves_unrelated_active_implementation(conn, tmp_path, monkeypatch, surface):
+    import subprocess
+    import sys
+
+    from plugins.kanban.dashboard import plugin_api as api
+
+    db_path = str(tmp_path / "kanban.db")
+    monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
+    implementation = kb.create_task(conn, title="Implementation", assignee="builder")
+    active = kb.claim_task(conn, implementation, claimer="remote:builder")
+    # Reopening does not grant authority to bypass an unfinished dependency.
+    # This independent card has no dependency on the unrelated active worker.
+    reviewer = kb.create_task(conn, title="Independent review", assignee="reviewer")
+    kb.recompute_ready(conn)
+    review_run = kb.claim_task(conn, reviewer, claimer="remote:reviewer")
+    old_head, new_head = "a" * 40, "b" * 40
+    assert kb.request_review(conn, reviewer, summary="Prior candidate examined", metadata={"head": old_head}, expected_run_id=review_run.current_run_id)
+    kb.add_comment(conn, reviewer, "operator", f"Review delta {old_head}..{new_head}; preserve canonical IDs")
+    history = kb.list_runs(conn, reviewer)
+    if surface == "cli":
+        env = {"HOME": str(tmp_path), "HERMES_HOME": str(tmp_path / "home"),
+               "HERMES_KANBAN_HOME": str(tmp_path / "home"), "HERMES_KANBAN_DB": db_path,
+               "PATH": str(tmp_path / "empty-bin"), "LANG": "C.UTF-8"}
+        result = subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", "reopen-review", reviewer],
+                                cwd=Path(__file__).resolve().parents[2], env=env,
+                                capture_output=True, text=True, timeout=40)
+        assert result.returncode == 0, result.stderr + result.stdout
+        assert f"Reopened {reviewer}" in result.stdout
+    else:
+        api.update_task(reviewer, api.UpdateTaskBody(status="ready"), board="default")
+    assert kb.get_task(conn, implementation) == active
+    assert kb.get_task(conn, reviewer).assignee == "reviewer"
+    assert kb.list_runs(conn, reviewer) == history
+    assert kbd.check_respawn_guard(conn, reviewer) is None
+    assert kb.claim_task(conn, reviewer, claimer="remote:reviewer")
+    assert kb.claim_task(conn, reviewer, claimer="remote:duplicate") is None
+
+
+def test_review_dispatch_does_not_restart_completed_or_waiting_implementation(conn):
+    parked = kb.create_task(conn, title="PR awaiting human", assignee="builder")
+    assert kb.complete_task(conn, parked, summary="Implementation finished")
+    # Persisted format from the former completion adapter; not a new handoff.
+    with kbc.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (parked,))
+        kb._append_event(conn, parked, "status", {"status": "review", "actor": "one-card"})
+    required = kb.create_task(conn, title="Await canonical review", assignee="builder",
+                              review_requirement={"required": True, "owner": "reviewer"})
+    assert kb.complete_task(conn, required, summary="Candidate ready")
+    for tid in (parked, required):
+        assert tid not in [row["id"] for row in kbd._lane_rows(conn, "review")]
+        assert kb.claim_review_task(conn, tid, claimer="remote:worker") is None
 
 
 def test_review_transitions_preserve_consecutive_failures(conn) -> None:

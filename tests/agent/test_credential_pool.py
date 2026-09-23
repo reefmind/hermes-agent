@@ -1756,10 +1756,55 @@ def test_nous_seed_from_singletons_preserves_obtained_at_timestamps(tmp_path, mo
 
 
 
+def _codex_account_token(account_id: str, marker: str) -> str:
+    return _jwt_with_claims(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+            },
+            "marker": marker,
+        }
+    )
 
 
+def _codex_auth_store(access_token: str, refresh_token: str) -> dict:
+    return {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                },
+            }
+        },
+    }
 
 
+def test_sync_codex_entry_adopts_rotated_token_for_same_account(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    old_token = _codex_account_token("acct-same", "old")
+    fresh_token = _codex_account_token("acct-same", "fresh")
+    _write_auth_store(tmp_path, _codex_auth_store(fresh_token, "refresh-new"))
+    entry = PooledCredential(
+        provider="openai-codex",
+        id="codex-singleton",
+        label="Codex",
+        auth_type="oauth",
+        priority=0,
+        source="device_code",
+        access_token=old_token,
+        refresh_token="refresh-old",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+
+    synced = pool._sync_entry_from_auth_store(entry)
+
+    assert synced.access_token == fresh_token
+    assert synced.refresh_token == "refresh-new"
 
 
 def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
@@ -2152,3 +2197,78 @@ def test_an_exhaustion_newer_than_the_reset_still_binds(tmp_path, monkeypatch):
     live._persist()
     assert _disk_entry(tmp_path)["last_status"] == "exhausted"
     assert live.select() is None
+
+
+# --- local tests restored after the 2026-09-23 upstream merge ---
+
+def test_sync_codex_entry_adopts_refresh_when_store_has_no_access_token(
+    tmp_path, monkeypatch
+):
+    """A refresh-only rotation must still be adopted.
+
+    Regression guard. When another process rotates the Codex pair, auth.json
+    can legitimately hold a fresh single-use refresh_token before any
+    access_token is written. Requiring store_access here left the entry
+    replaying the CONSUMED refresh token -> invalid_grant -> credential wipe.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    old_token = _codex_account_token("acct-same", "old")
+    _write_auth_store(tmp_path, _codex_auth_store("", "refresh-rotated"))
+    entry = PooledCredential(
+        provider="openai-codex",
+        id="codex-singleton",
+        label="Codex",
+        auth_type="oauth",
+        priority=0,
+        source="device_code",
+        access_token=old_token,
+        refresh_token="refresh-consumed",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+
+    synced = pool._sync_entry_from_auth_store(entry)
+
+    assert synced.refresh_token == "refresh-rotated", (
+        "refresh-only rotation was not adopted; the entry would replay the "
+        "consumed single-use refresh token"
+    )
+    # No access_token in the store, so the entry keeps its own.
+    assert synced.access_token == old_token
+
+
+def test_sync_codex_entry_adopts_when_entry_has_no_readable_identity(
+    tmp_path, monkeypatch
+):
+    """An entry with no decodable account id must remain recoverable.
+
+    Regression guard. Requiring BOTH sides to expose a chatgpt_account_id made
+    an entry whose access_token is empty/opaque permanently unable to adopt
+    from the store -- i.e. the identity gate blocked the very recovery path it
+    was meant to protect. Absence is not a mismatch.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    fresh_token = _codex_account_token("acct-same", "fresh")
+    _write_auth_store(tmp_path, _codex_auth_store(fresh_token, "refresh-new"))
+    entry = PooledCredential(
+        provider="openai-codex",
+        id="codex-singleton",
+        label="Codex",
+        auth_type="oauth",
+        priority=0,
+        source="device_code",
+        access_token="",           # wiped/rotated away: no identity to read
+        refresh_token="refresh-old",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+
+    synced = pool._sync_entry_from_auth_store(entry)
+
+    assert synced.access_token == fresh_token, (
+        "entry with no readable identity was refused; it would be "
+        "permanently unrecoverable after a rotation or wipe"
+    )
+    assert synced.refresh_token == "refresh-new"

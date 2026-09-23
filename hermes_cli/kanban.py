@@ -359,6 +359,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    review_required = bool(getattr(args, "review_required", False))
+    review_owner = getattr(args, "review_owner", None)
+    review_task_id = getattr(args, "review_task_id", None)
+    if (review_owner or review_task_id) and not review_required:
+        print(
+            "kanban: --review-owner/--review-task-id require --review-required",
+            file=sys.stderr,
+        )
+        return 2
+    if review_required and not review_owner:
+        print("kanban: --review-required requires --review-owner", file=sys.stderr)
+        return 2
+    review_requirement = None
+    if review_required:
+        review_requirement = {"required": True, "owner": review_owner}
+        if review_task_id:
+            review_requirement["review_task_id"] = review_task_id
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
@@ -374,6 +391,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            review_requirement=review_requirement,
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
@@ -573,8 +591,18 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     with kbc.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
+        # ONE-CARD: report the effective assignee. A retired profile is remapped
+        # inside assign_task, so echoing the REQUESTED value would name something
+        # the row does not contain.
+        landed = profile
+        if ok:
+            row = conn.execute("SELECT assignee FROM tasks WHERE id = ?",
+                               (args.task_id,)).fetchone()
+            if row is not None:
+                landed = row["assignee"] if "assignee" in row.keys() else row[0]
+    note = "" if landed == profile else f" (requested {profile}; that role is retired)"
     return _ok_or_err(ok, f"no such task: {args.task_id}",
-                      f"Assigned {args.task_id} to {profile or '(unassigned)'}")
+                      f"Assigned {args.task_id} to {landed or '(unassigned)'}{note}")
 
 
 def _cmd_set_model(args: argparse.Namespace) -> int:
@@ -909,7 +937,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
-            gate_err = _goal_gate_error(
+            from hermes_cli.kanban_review_reconcile import is_phase_submission
+            gate_err = None if is_phase_submission(conn, kb.get_task(conn, tid), metadata) else _goal_gate_error(
                 conn, tid, (summary or args.result or "").strip(), "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
                 "Provide evidence matching the task's acceptance criteria.")
@@ -1038,15 +1067,15 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        gate_err = _goal_gate_error(
-            conn, tid, summary or "", "review handoff",
-            "Record the block with kanban block instead of requesting review.",
-            "Provide acceptance evidence matching the task.")
-        if gate_err:
-            return _err(gate_err)
-        ok, reason = kb.request_review(
-            conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+        from hermes_cli.kanban_review_reconcile import is_phase_submission
+        if is_phase_submission(conn, kb.get_task(conn, tid), metadata):
+            ok = kb.complete_task(conn, tid, summary=summary, metadata=metadata,
+                                  expected_run_id=_worker_run_id_for(tid))
+            reason = None if ok else "phase handoff refused by ownership/state fence"
+        else:
+            ok, reason = kb.request_review(
+                conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
+                expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)

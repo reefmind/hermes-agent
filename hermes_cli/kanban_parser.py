@@ -203,6 +203,9 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
+        _arg("--review-required", action="store_true", help="Require independent review before final acceptance"),
+        _arg("--review-owner", help="Profile owning the explicit review handoff"),
+        _arg("--review-task-id", help="Canonical existing review child id"),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",

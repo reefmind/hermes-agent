@@ -64,6 +64,18 @@ _READ_PROBE_STATEMENTS: Optional[tuple] = None
 _FTS_TRIGRAM_TRIGGERS = tuple(n for n in _FTS_TRIGGERS if "_trigram_" in n)
 _FTS_BASE_TRIGGERS = tuple(n for n in _FTS_TRIGGERS if n not in _FTS_TRIGRAM_TRIGGERS)
 
+
+def _trigram_disabled() -> bool:
+    """HERMES_DISABLE_FTS_TRIGRAM=1 (Brett, 2026-09-06; re-anchored after the
+    upstream split). Documented upstream but never enforced: without this gate
+    every gateway start on the 8 GB state.db re-creates the trigram FTS index
+    and its triggers and runs a full rebuild on the event loop — 1.2 GB RSS,
+    silent for minutes, then the shutdown watchdog kills it (exit 75) and it
+    loops. Gate ALL three trigram paths: DDL ensure, trigger install, rebuild."""
+    import os
+    return os.environ.get("HERMES_DISABLE_FTS_TRIGRAM", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # (base DDL, trigram DDL) keyed by "legacy inline layout?" — v23 external-content vs pre-v23 inline.
 _FTS_DDL = {False: (FTS_SQL, FTS_TRIGRAM_SQL), True: (LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL)}
 _LEGACY_INLINE_CONCAT_SQL = (
@@ -264,7 +276,8 @@ class SessionSchemaMixin:
         # Re-apply current DDL (legacy vs v23 as _init_schema does) so CREATE TRIGGER installs OF variants.
         base_sql, trigram_sql = _FTS_DDL[legacy_layout]
         self._ensure_fts_schema(cursor, "messages_fts", base_sql)
-        self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+        if not _trigram_disabled():
+            self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
         # Only recreate the CJK trigger this migration dropped. ``_ensure_fts_cjk_schema`` soft-fails
         # (never raises), so afterwards require a narrowed trigger or durable quarantine.
         if "messages_fts_cjk_update" in to_drop:
@@ -1227,7 +1240,8 @@ class SessionSchemaMixin:
                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
                 if not self._fts_enabled:
                     return
-                self._trigram_available = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                self._trigram_available = (False if _trigram_disabled()  # HERMES_DISABLE_FTS_TRIGRAM
+                                           else self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql))
                 self._rebuild_fts_indexes(
                     cursor, legacy=legacy_fts, include_trigram=self._trigram_available,
                 )
@@ -1243,7 +1257,8 @@ class SessionSchemaMixin:
                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
                 if self._fts_enabled:
                     # Trigram is optional; without it CJK search falls back to LIKE.
-                    trigram_enabled = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                    trigram_enabled = (False if _trigram_disabled()  # HERMES_DISABLE_FTS_TRIGRAM
+                                       else self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql))
                     self._trigram_available = trigram_enabled
                     if trigram_enabled and trigram_triggers_missing:
                         self._run_admitted_startup_rebuild(

@@ -54,8 +54,8 @@ class Pruner:
     def reclaim(self) -> None:
         """Full ``git gc`` — tens of seconds on a GB store, so only the periodic prune calls it.
         A ref rewrite that ran without it leaves a marker so the next prune reclaims."""
-        self._git(["reflog", "expire", "--expire=now", "--all"])
-        self._git(["gc", "--prune=now", "--quiet"], timeout=self.timeout * 3)
+        self._git(["reflog", "expire", "--expire=30.minutes.ago", "--all"])
+        self._git(["gc", "--prune=30.minutes.ago", "--quiet"], timeout=self.timeout * 3)
         # Bare stores must remain usable when gc packs all refs.
         for name in ("refs/heads", "branches"):
             (self.store / name).mkdir(parents=True, exist_ok=True)

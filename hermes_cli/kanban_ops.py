@@ -106,15 +106,25 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            # Hold buckets. Every one of these can be the sole reason a tick
+            # spawned nothing; omitting them from the machine-readable payload
+            # is what made a fully-held board look identical to an idle one.
             "respawn_guarded": [
-                {"task_id": tid, "reason": reason}
-                for (tid, reason) in res.respawn_guarded
+                {"task_id": tid, "reason": why}
+                for (tid, why) in (getattr(res, "respawn_guarded", None) or [])
             ],
-            "rate_limited": res.rate_limited,
-            "skipped_locked": res.skipped_locked,
-            "memory_pressure": res.memory_pressure,
+            "rate_limited": list(getattr(res, "rate_limited", None) or []),
+            "skipped_locked": bool(getattr(res, "skipped_locked", False)),
+            "memory_pressure": getattr(res, "memory_pressure", None),
+            "capacity_hold": getattr(res, "capacity_hold", None),
+            "delivery_holds": list(getattr(res, "delivery_holds", [])),
         }, ascii=True)
         return 0
+    if getattr(res, "capacity_hold", None):
+        hold = res.capacity_hold
+        print(f"Capacity hold ({hold['scope']}): {hold['running']} running / {hold['limit']} limit; resumes when a slot frees. --max is total concurrency, not extra spawns.")
+    for tid, why in getattr(res, "delivery_holds", []):
+        print(f"Delivery hold: {tid}: {why}")
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:
         print(f"Reaped workers of finished tasks: {', '.join(res.reaped_terminal_workers)}")
@@ -132,6 +142,20 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    # Brett, 2026-08-16/09-06 (re-anchored after the upstream split): respawn_guarded
+    # was the ONLY DispatchResult bucket this command never printed, so `dispatch`
+    # reported a bare "Spawned: 0" while every ready card was silently held — the
+    # queue looked healthy while nothing moved.
+    if getattr(res, "respawn_guarded", None):
+        print(f"Held by respawn guard: {len(res.respawn_guarded)}")
+        for tid, why in res.respawn_guarded:
+            hint = {
+                "active_pr": "a PR URL was posted in the last 24h",
+                "recent_success": "completed within the last hour, not requeued since",
+                "rate_limit_cooldown": "last run hit a provider quota wall; cooling down",
+                "blocker_auth": "last failure looks like auth/quota; deferring",
+            }.get(why, why)
+            print(f"  - {tid}  ({why}: {hint})")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
@@ -146,14 +170,27 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
-    for tid, reason in res.respawn_guarded:
-        print(f"Guarded ({reason}): {tid}")
-    if res.rate_limited:
-        print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
-    if res.skipped_locked:
-        print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
-    if res.memory_pressure:
-        print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    for tid, why in getattr(res, "respawn_guarded", []):
+        print(f"Respawn guard: {tid}: {why}; use `hermes kanban promote {tid}` for one authorized continuation")
+    # The remaining three holds had no text output at all. Each can be the
+    # only reason a tick spawned nothing, so each gets a named line.
+    rate_limited = getattr(res, "rate_limited", None) or []
+    if rate_limited:
+        print(f"Released on provider rate limit: {len(rate_limited)}")
+        print(f"  {', '.join(rate_limited)}")
+    if getattr(res, "skipped_locked", False):
+        print(
+            "Tick skipped: another dispatcher holds the board dispatch lock. "
+            "No reclaim/spawn writes happened this tick."
+        )
+    memory_pressure = getattr(res, "memory_pressure", None)
+    if memory_pressure:
+        detail = (
+            "no new workers were spawned this tick"
+            if memory_pressure == "critical"
+            else "at most one new worker was spawned this tick"
+        )
+        print(f"Memory pressure ({memory_pressure}): {detail}.")
     return 0
 
 

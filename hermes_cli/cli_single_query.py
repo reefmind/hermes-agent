@@ -79,6 +79,9 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
     goal_text = "\n\n".join(p for p in (task.title or "", task.body) if p).strip()
     if not goal_text:
         return
+    # BLOCK-CONTRACT-GOALLOOP (2026-09-15): same doctrine preface the judge gate uses.
+    from tools.kanban_tools import _ONE_CARD_DOCTRINE as _doctrine
+    goal_text = _doctrine + goal_text
 
     def _quiet_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
@@ -92,9 +95,19 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
         with _kbc.connect_closing() as c:
             return _kb.goal_run_status(c, task_id, worker_run_id)
 
-    def _block(reason: str) -> None:
+    def _block(reason: str) -> None:  # BLOCK-CONTRACT-GOALLOOP-BLOCK
+        structured = (
+            "WHAT I NEED: a decision from Brett or Meghann on whether this card can be "
+            "completed as written\n"
+            f"WHY: {reason}\n"
+            "DO THIS:\n"
+            "  1. Read the WHY line and the card's latest comment.\n"
+            f"  2. Reply in this thread with `unblock {task_id}` plus the decision, "
+            f"or `archive {task_id}` to close it."
+        )
         with _kbc.connect_closing() as c:
-            _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
+            _kb.block_task(c, task_id, reason=structured, kind="needs_input",
+                           expected_run_id=worker_run_id)
 
     _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,

@@ -12,8 +12,17 @@ from hermes_cli import kanban_db as kb
 
 _STATUS_ICONS = {
     "todo": "◻", "ready": "▶", "running": "●", "scheduled": "⏱",
-    "blocked": "⊘", "done": "✓", "archived": "—",
+    "blocked": "⊘", "done": "✓", "archived": "—", "triage": "◷", "review": "👀",
 }
+# BLOCK-CONTRACT-DISPLAY (2026-09-15): Brett reads five states. Internal
+# pre-claim statuses all mean "waiting for a worker"; running means a worker
+# holds the claim. The DB keeps its own vocabulary; only the label changes.
+_DISPLAY_STATUS = {"todo": "triage", "scheduled": "triage", "ready": "triage",
+                   "running": "in_progress"}
+
+
+def display_status(status: str) -> str:
+    return _DISPLAY_STATUS.get(status, status)
 
 _TASK_DICT_FIELDS = (
     "id", "title", "body", "assignee", "status", "priority", "tenant",
@@ -75,7 +84,7 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    return f"{icon} {t.id}  {display_status(t.status):11s}  {assignee:20s}{tenant}  {t.title}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:

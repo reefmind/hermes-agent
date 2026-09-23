@@ -1601,13 +1601,21 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
 
 # Judge says done but the worker never made a terminal board call
 # (kanban_complete/kanban_request_review/kanban_block): one explicit nudge.
+# How many finalize nudges before giving up and blocking the task.
+KANBAN_MAX_FINALIZE_NUDGES = 2
+
 KANBAN_GOAL_FINALIZE_TEMPLATE = (
-    "[The work looks complete, but the task is still open]\n"
+    "[STOP \u2014 this turn must be a TOOL CALL, not a message]\n\n"
+    "The work looks complete but the task is still open.\n"
     "Reason: {reason}\n\n"
-    "If the task is genuinely done, call kanban_complete now with a short "
-    "summary of what you did. If it is a code change awaiting same-card review, "
-    "call kanban_request_review with that summary instead. If something still "
-    "blocks completion, call kanban_block with the reason instead."
+    "Your entire response this turn must be exactly one of these tool calls:\n"
+    "  - kanban_complete(summary=...)        the task is genuinely done\n"
+    "  - kanban_request_review(summary=...)  a code change awaiting same-card review\n"
+    "  - kanban_block(reason=...)            something still prevents completion\n\n"
+    "Do NOT reply with prose, a status report, or a summary of what you did \u2014 "
+    "text without a tool call does not close the task. If you answer in prose "
+    "again this run is abandoned and all the work above is thrown away, even "
+    "though it is finished. Emit the tool call now."
 )
 
 
@@ -1663,7 +1671,7 @@ def run_kanban_goal_loop(
 
     last_response = first_response or ""
     turns_used = 1   # the first turn already consumed one unit of budget
-    nudged_to_finalize = False
+    finalize_nudges = 0
 
     while True:
         try:
@@ -1696,15 +1704,18 @@ def run_kanban_goal_loop(
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
         if verdict == "blocked":
-            # Unachievable is NOT done: block the card with the judge's reason now instead of
-            # re-poking an impossible goal, and never let it land in done.
-            # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
-            _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
-            _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
-            return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
+            # An auxiliary verdict is not evidence of a human decision. Let the
+            # owned worker use the structured block boundary for a genuine need,
+            # or submit the pending review phase. Never invent needs_input merely
+            # because final review/CI gates have not happened yet.
+            reason = (f"Judge concern: {reason}. Missing review or CI is workflow state, "
+                      "not an impossible goal. Submit candidate-ready evidence to the "
+                      "existing canonical reviewer; use kanban_block only for a concrete "
+                      "human decision or inaccessible capability.")
+            verdict = "continue"
 
         if verdict == "done":
-            if nudged_to_finalize:
+            if finalize_nudges >= KANBAN_MAX_FINALIZE_NUDGES:
                 # Already asked once to call kanban_complete — block for review rather than spin.
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
                 _block(
@@ -1713,7 +1724,7 @@ def run_kanban_goal_loop(
                 )
                 return _result("blocked_budget", "judged done, never finalized")
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
-            nudged_to_finalize = True
+            finalize_nudges += 1
         else:
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
 

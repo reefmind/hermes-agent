@@ -739,6 +739,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             (task_id,)).fetchone()
         if prev is None:
             return False
+
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
@@ -1308,6 +1309,7 @@ class RenameBoardBody(BaseModel):
     # For both fields: ``None`` = leave unchanged; "" = clear; value = validate/resolve + set.
     default_workdir: Optional[str] = None
     project_id: Optional[str] = None
+    review_requirement: Optional[dict] = None
 
 
 # Board transfer exchanges filesystem PATHS, not bytes (same contract as profile export/import):

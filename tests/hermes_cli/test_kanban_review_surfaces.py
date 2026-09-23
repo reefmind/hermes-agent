@@ -265,7 +265,7 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
         assert secret not in comments[0].body
 
 
-def test_goal_mode_review_handoff_cannot_bypass_judge(
+def test_goal_mode_review_handoff_is_not_final_completion(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -302,15 +302,14 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             False,
         ),
     )
-    rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
-    assert "error" in rejected
-    assert "rejected by judge" in rejected["error"]
+    handed_off = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
+    assert handed_off["ok"]
     with kbc.connect() as conn:
         tool_after = kb.get_task(conn, tool_task)
         assert tool_after is not None
-        assert tool_after.status == "running"
+        assert tool_after.status == "review"
 
-    # The shell/CLI path applies the same gate and must not bypass the tool.
+    # The shell/CLI path also parks review without claiming final completion.
     with kbc.connect() as conn:
         cli_task = kb.create_task(
             conn,
@@ -337,11 +336,11 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         lambda *args, **kwargs: ("continue", "tests are missing", False, None, False),
     )
     output = kc.run_slash(f"request-review {cli_task} --summary 'Looks ready.'")
-    assert "rejected by judge" in output
+    assert "Requested review" in output
     with kbc.connect() as conn:
         cli_after = kb.get_task(conn, cli_task)
         assert cli_after is not None
-        assert cli_after.status == "running"
+        assert cli_after.status == "review"
 
 
 def test_goal_loop_stops_after_reviewer_requests_changes(

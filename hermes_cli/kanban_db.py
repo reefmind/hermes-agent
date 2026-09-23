@@ -24,7 +24,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Mapping
 
 from toolsets import get_toolset_names
 
@@ -106,10 +106,25 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Review rounds (changes_requested events) after which request_changes parks the
+# card in a sticky needs_input block instead of another silent cycle (Brett 2026-09-06).
+_REVIEW_CYCLE_CAP = int(os.environ.get("KANBAN_REVIEW_CYCLE_CAP", "4"))
+
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def _decode_review_requirement(raw: Any) -> Optional[dict[str, Any]]:
+    """Decode a persisted review contract without making row reads fragile."""
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return dict(value) if isinstance(value, dict) else None
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -737,6 +752,7 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    review_requirement: Optional[dict[str, Any]] = None
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -755,6 +771,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            review_requirement=_decode_review_requirement(g("review_requirement")),
         )
 
 
@@ -960,6 +977,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- profile's state.db (kanban_create verifies before stamping). Indexed
     -- so per-session list queries stay cheap on larger boards.
     session_id           TEXT,
+    -- Explicit independent-review contract. NULL preserves ordinary legacy
+    -- completion. JSON shape: {required:true, owner:<profile>,
+    -- review_task_id?:<canonical dependency child>}.
+    review_requirement   TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -1069,6 +1090,28 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Per-event delivery ledger.  A subscription cursor is only a compact scan
+-- position; it is not an acknowledgement.  These rows survive the process
+-- boundary between discovering an event and handing it to a remote adapter.
+CREATE TABLE IF NOT EXISTS kanban_notify_deliveries (
+    task_id       TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    event_id      INTEGER NOT NULL,
+    delivery_token TEXT NOT NULL,
+    delivery_identity TEXT,
+    state         TEXT NOT NULL DEFAULT 'pending',
+    claim_token   TEXT,
+    claim_owner   TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    message_id    TEXT,
+    last_error    TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id, event_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1078,6 +1121,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_delivery_state ON kanban_notify_deliveries(state, updated_at);
 """
 
 
@@ -1117,6 +1161,29 @@ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> t
     return model, provider
 
 
+def _remap_retired_assignee(assignee: Optional[str]) -> tuple:
+    """``(effective_assignee, retired_from)`` for a possibly-retired profile.
+
+    ONE-CARD: roles that only made sense when work was split across cards cannot
+    carry a card to completion, so assigning one is a deadlock. Call this from
+    EVERY path that sets ``tasks.assignee`` -- there are two, and the second one
+    is how this came back. Unknown config or a missing key is a no-op.
+    """
+    if not assignee:
+        return assignee, None
+    try:
+        from hermes_cli.config import load_config_readonly as _lcr
+        retired = (_lcr() or {}).get("kanban", {}).get("retired_assignees") or {}
+        target = str(retired.get(str(assignee).strip()) or "").strip()
+    except Exception:
+        return assignee, None
+    if not target or target == assignee:
+        return assignee, None
+    _log.info("kanban: assignee %r is retired under one-card; routing to %r",
+              assignee, target)
+    return target, assignee
+
+
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
     if assignee is None:
@@ -1124,6 +1191,45 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def normalize_review_requirement(value: Any) -> Optional[dict[str, Any]]:
+    """Validate and canonicalize an explicit independent-review contract.
+
+    Absence means an ordinary task. A present contract is intentionally only a
+    required contract; accepting ``required=false`` would create a second way
+    to spell absence and make downgrade attempts ambiguous.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("review_requirement must be an object")
+    unknown = set(value) - {"required", "owner", "review_task_id"}
+    if unknown:
+        raise ValueError(
+            "review_requirement has unknown field(s): " + ", ".join(sorted(unknown))
+        )
+    required = value.get("required")
+    if not isinstance(required, bool):
+        raise ValueError("review_requirement.required must be a boolean")
+    if not required:
+        raise ValueError("review_requirement.required must be true when present")
+    owner_raw = value.get("owner")
+    if not isinstance(owner_raw, str) or not owner_raw.strip():
+        raise ValueError("review_requirement.owner is required")
+    owner = _canonical_assignee(owner_raw)
+    review_task_raw = value.get("review_task_id")
+    review_task_id = None
+    if review_task_raw is not None:
+        if not isinstance(review_task_raw, str) or not review_task_raw.strip():
+            raise ValueError(
+                "review_requirement.review_task_id must be a non-empty task id"
+            )
+        review_task_id = review_task_raw.strip()
+    result: dict[str, Any] = {"required": True, "owner": owner}
+    if review_task_id is not None:
+        result["review_task_id"] = review_task_id
+    return result
 
 
 def _resolve_project_link(
@@ -1264,6 +1370,7 @@ def create_task(
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    review_requirement: Optional[Mapping[str, Any]] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
 ) -> str:
@@ -1289,6 +1396,7 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    review_requirement = normalize_review_requirement(review_requirement)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1317,18 +1425,32 @@ def create_task(
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
-    parents = tuple(p for p in parents if p)
+    parents = tuple(parents)
+    # ONE-CARD: retired assignees (2026-09-08). Roles that only made sense when
+    # work was split across cards -- a reviewer that may not touch a repo, an
+    # orchestrator that fans out into children -- can no longer carry a card to
+    # completion. Assigning one is a deadlock, so remap it at creation and say so
+    # in the card's own event log. Config: kanban.retired_assignees.
+    assignee, _retired_from = _remap_retired_assignee(assignee)
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, review_requirement FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
+            existing_requirement = _decode_review_requirement(
+                row["review_requirement"]
+            )
+            if existing_requirement != review_requirement:
+                raise ValueError(
+                    "idempotency key already belongs to a task with a different "
+                    "review_requirement"
+                )
             return row["id"]
 
     now = int(time.time())
@@ -1365,8 +1487,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, review_requirement, completion_contract
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1375,17 +1497,50 @@ def create_task(
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
-                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
+                        json.dumps(review_requirement, sort_keys=True) if review_requirement is not None else None,
+                        completion_contract,
                     ),
                 )
                 for pid in parents:
                     _link(conn, pid, task_id)
+                canonical_review_id = (
+                    review_requirement.get("review_task_id")
+                    if review_requirement is not None
+                    else None
+                )
+                if canonical_review_id:
+                    if get_task(conn, canonical_review_id) is None:
+                        raise ValueError(
+                            "review_requirement.review_task_id "
+                            f"{canonical_review_id} does not exist"
+                        )
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                        "VALUES (?, ?)",
+                        (task_id, canonical_review_id),
+                    )
+                    _validate_canonical_review_child(
+                        conn, task_id, canonical_review_id, assignee
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET status = 'todo' "
+                        "WHERE id = ? AND status = 'ready'",
+                        (canonical_review_id,),
+                    )
+                    _append_event(
+                        conn,
+                        canonical_review_id,
+                        "linked",
+                        {"parent": task_id, "child": canonical_review_id},
+                    )
                 _append_event(
                     conn,
                     task_id,
                     "created",
                     {
                         "assignee": assignee,
+                        "retired_from": _retired_from,
                         "status": task_status,
                         "parents": list(parents),
                         "creator_task_id": creator_task_id,
@@ -1553,6 +1708,10 @@ def list_tasks(
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
+    # ONE-CARD: reassignment is the second door. create_task was guarded and this
+    # was not, so `hermes kanban assign <id> pr-reviewer` and the dashboard's
+    # reassign control could still park a card on a profile that cannot finish it.
+    profile, _retired_from = _remap_retired_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -1574,9 +1733,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
         # a no-op re-assign or an unassign, which must not lift ``active_pr``.
-        _append_event(
-            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
-        )
+        _append_event(conn, task_id, "assigned",
+                      {"assignee": profile, "from": row["assignee"], "retired_from": _retired_from})
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee",))
     return True
@@ -1655,11 +1813,8 @@ def link_tasks(
         child = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id = ?", (child_id,),
         ).fetchone()
-        if child["status"] == "running" and (
-            expected_child_run_id is None
-            or child["current_run_id"] != expected_child_run_id
-        ):
-            raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
+        # Upstream refuses to link a running child without expected_child_run_id; the local
+        # reviewer-recovery flow links a running review child deliberately, so that check is off.
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
@@ -1780,7 +1935,9 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(conn, task_id, "commented", {
+            "author": author, "len": len(body), "comment_id": int(cur.lastrowid or 0),
+        })
         return int(cur.lastrowid or 0)
 
 
@@ -1797,6 +1954,14 @@ def _task_rows(conn: sqlite3.Connection, table: str, task_id: str, order: str) -
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     return [Comment.from_row(r) for r in _task_rows(conn, "task_comments", task_id, "created_at ASC")]
+
+
+def get_comment(conn: sqlite3.Connection, task_id: str, comment_id: int) -> Optional[Comment]:
+    """Resolve an event's exact comment without crossing task boundaries."""
+    row = conn.execute(
+        "SELECT * FROM task_comments WHERE task_id = ? AND id = ?", (task_id, comment_id)
+    ).fetchone()
+    return Comment.from_row(row) if row else None
 
 
 def list_comments_after(
@@ -2098,7 +2263,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "  (SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'unblocked'), 0) "
         "ORDER BY id DESC LIMIT 1", (task_id, task_id),
     ).fetchone()
-    return bool(trip) and bool(_json_dict(trip["payload"]).get("sticky"))
+    if not trip:
+        return False
+    _p = _json_dict(trip["payload"])
+    # Local (2026-09): an exhausted protocol-violation retry budget is sticky too.
+    return bool(_p.get("sticky") or _p.get("protocol_violations"))
 
 
 def _latest_event(
@@ -2195,14 +2364,50 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 
 # --- Claim / complete / block ---
 
+_REVIEW_CHILD_TITLE_RE = re.compile(r"\breview\b", re.IGNORECASE)
+
+
+
+def _adopt_passed_review_child(conn: sqlite3.Connection, task_id: str, implementer: Optional[str], expected_head: Optional[str] = None) -> Optional[str]:
+    """Bind a linked review child that already holds a PASS to a contract with no review_task_id.
+
+    Brett, 2026-09-07 (end-to-end smoke card t_d197a6b5): the 2026-09-07 canonical-review
+    rewrite parks completion in ``review`` whenever ``review_task_id`` is None — even when a
+    linked, independent review child is ``done`` with ``metadata.verdict == "PASS"`` for this
+    card's exact head. Workers create that child with ``kanban_create --parent`` and never bind
+    it back, so the parent could never complete. Adopt it by evidence: newest done review child,
+    independent of the implementer, with exact-artifact PASS evidence.
+    """
+    rows = conn.execute(
+        "SELECT c.id, c.assignee, c.title FROM task_links l JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ? AND c.status = 'done' ORDER BY c.completed_at DESC, c.id DESC",
+        (task_id,),
+    ).fetchall()
+    for r in rows:
+        if not _REVIEW_CHILD_TITLE_RE.search(r["title"] or ""):
+            continue
+        if implementer and r["assignee"] and _canonical_assignee(r["assignee"]) == _canonical_assignee(implementer):
+            continue
+        ev = _completed_artifact_evidence(conn, r["id"])
+        if ev is None:
+            continue
+        # Exact-head only: a PASS at an older head must never close the parent
+        # (the t_7b63fb7b class: "reopen the reviewer at this head").
+        if isinstance(expected_head, str) and re.fullmatch(r"[0-9a-f]{40}", expected_head) and ev["head"] != expected_head:
+            continue
+        return r["id"]
+    return None
+
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
+    """Only completed phases release dependencies; titles never grant authority."""
+    unfinished = conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
         "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
-    ).fetchone() is None
+    ).fetchone()
+    return unfinished is None
 
 
 def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
@@ -2266,6 +2471,29 @@ def _claim_and_open_run(
     return run_id
 
 
+def pending_parents(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    """Return the direct parents that are still holding ``task_id`` back.
+
+    The read half of :func:`_parents_satisfied`: an empty list means the same
+    thing as ``_parents_satisfied() is True``, but the rows let a caller *name*
+    what the task is waiting for. The notifier uses it so a dependency-wait
+    notice says which card must finish instead of leaving the operator to go
+    look — and so a dependency wait with an empty list can be reported as the
+    auto-respin hazard it is.
+    """
+    return [
+        {"id": row["id"], "title": row["title"], "status": row["status"]}
+        for row in conn.execute(
+            "SELECT p.id AS id, p.title AS title, p.status AS status "
+            "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? "
+            "AND p.status NOT IN ('done', 'archived') "
+            "ORDER BY p.id",
+            (task_id,),
+        ).fetchall()
+    ]
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
@@ -2301,6 +2529,19 @@ def claim_task(
     return claimed
 
 
+def review_task_dispatchable(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Do not reinterpret a completed PR or a waiting implementation as a reviewer.
+
+    Older completion adapters parked successful cards in the review column.
+    Those require an explicit reopen, not an automatic second worker.
+    """
+    task = get_task(conn, task_id)
+    if task is None or task.status != "review" or task.review_requirement:
+        return False
+    run = latest_run(conn, task_id)
+    return run is None or run.outcome != "completed"
+
+
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
@@ -2312,6 +2553,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not review_task_dispatchable(conn, task_id):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2699,6 +2942,147 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _merged_review_requirement(
+    persisted: Any,
+    supplied: Any,
+) -> Optional[dict[str, Any]]:
+    """Merge a completion-time contract without allowing downgrade/rebind."""
+    decoded = _decode_review_requirement(persisted)
+    if persisted and decoded is None:
+        raise ValueError("persisted review_requirement is malformed")
+    current = normalize_review_requirement(decoded)
+    incoming = normalize_review_requirement(supplied) if supplied is not None else None
+    if current is None:
+        return incoming
+    if incoming is None:
+        return current
+    if incoming["owner"] != current["owner"]:
+        raise ValueError("review_requirement.owner cannot rebind an existing contract")
+    current_id = current.get("review_task_id")
+    incoming_id = incoming.get("review_task_id")
+    if current_id and incoming_id and current_id != incoming_id:
+        raise ValueError(
+            "review_requirement.review_task_id cannot rebind the canonical review"
+        )
+    if current_id:
+        return current
+    return incoming
+
+
+def _validate_canonical_review_child(
+    conn: sqlite3.Connection,
+    implementation_task_id: str,
+    review_task_id: str,
+    implementer: Optional[str],
+    *,
+    generation_handoff: bool = False,
+) -> None:
+    """Validate the explicit canonical pair while holding the write lock."""
+    if implementation_task_id == review_task_id:
+        raise ValueError("canonical review task cannot be the implementation task itself")
+    child = conn.execute(
+        "SELECT assignee, status FROM tasks WHERE id = ?", (review_task_id,)
+    ).fetchone()
+    if child is None:
+        raise ValueError(
+            f"review_requirement.review_task_id {review_task_id} does not exist"
+        )
+    linked = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (implementation_task_id, review_task_id),
+    ).fetchone()
+    if linked is None:
+        raise ValueError(
+            "canonical review task must depend on the implementation task"
+        )
+    if _would_cycle(conn, implementation_task_id, review_task_id):
+        raise ValueError("canonical review dependency would create a cycle")
+    for row in conn.execute(
+        "SELECT id, review_requirement FROM tasks "
+        "WHERE id != ? AND review_requirement IS NOT NULL",
+        (implementation_task_id,),
+    ).fetchall():
+        other = _decode_review_requirement(row["review_requirement"])
+        if other and other.get("review_task_id") == review_task_id:
+            raise ValueError(
+                f"canonical review task {review_task_id} is already canonically "
+                f"bound to implementation {row['id']}"
+            )
+    reviewer = _canonical_assignee(child["assignee"]) if child["assignee"] else None
+    canonical_implementer = (
+        _canonical_assignee(implementer) if implementer else None
+    )
+    if reviewer is None:
+        raise ValueError("canonical review task must have an assigned reviewer")
+    if canonical_implementer and reviewer == canonical_implementer:
+        raise ValueError("canonical review task must use an independent reviewer")
+    if child["status"] in {"running", "review"}:
+        raise ValueError("canonical review task is already active")
+    # Brett, 2026-09-07: a DONE reviewer that holds exact-artifact PASS evidence is
+    # not stale — it is the adopted verdict (see _adopt_passed_review_child). Only a
+    # done child WITHOUT evidence, or an archived one, is stale.
+    if child["status"] == "archived" or (
+        child["status"] == "done" and not generation_handoff
+        and _completed_artifact_evidence(conn, review_task_id) is None
+    ):
+        raise ValueError("canonical review task is stale because it is already terminal")
+
+
+def _canonical_review_parent(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+) -> Optional[tuple[str, dict[str, Any], Optional[str]]]:
+    """Return the one explicit parent contract naming ``review_task_id``."""
+    rows = conn.execute(
+        "SELECT t.id, t.review_requirement "
+        "FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+        "WHERE l.child_id = ?",
+        (review_task_id,),
+    ).fetchall()
+    matches: list[tuple[str, dict[str, Any], Optional[str]]] = []
+    for row in rows:
+        requirement = _decode_review_requirement(row["review_requirement"])
+        if not requirement or requirement.get("review_task_id") != review_task_id:
+            continue
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        implementer = None
+        if event and event["payload"]:
+            try:
+                payload = json.loads(event["payload"])
+                implementer = payload.get("implementer") if isinstance(payload, dict) else None
+            except (TypeError, json.JSONDecodeError):
+                pass
+        matches.append((row["id"], requirement, implementer))
+    if len(matches) > 1:
+        raise ValueError("review task is canonically bound to multiple implementations")
+    return matches[0] if matches else None
+
+
+def _completion_observation_matches(
+    conn: sqlite3.Connection, task_id: str,
+    expected_status: Optional[str], expected_event_id: Optional[int],
+) -> bool:
+    """Compare a reconciler's observation without changing task state."""
+    if expected_status is not None:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != expected_status:
+            return False
+    if expected_event_id is not None:
+        latest_event = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        if latest_event != expected_event_id:
+            return False
+    return True
+
+
 class LiveClaimError(ValueError):
     """``complete_task`` refused: the task is ``running`` under a live claim and
     the caller neither owns its run (``expected_run_id``) nor passed ``force``.
@@ -2728,112 +3112,162 @@ def _claim_is_live(trow) -> bool:
     )
 
 
-def complete_task(
-    conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
-    summary: Optional[str] = None, metadata: Optional[dict] = None,
-    created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True, force: bool = False,
-) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
-
-    ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval. A ``running`` task under a live claim is only completed with
-    proof of ownership (``expected_run_id``) or ``force=True`` (explicit
-    operator override) — otherwise :class:`LiveClaimError`, the same fence
-    :func:`request_review` applies. With no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
-    ``created_cards`` are verified first — a phantom id raises
-    :class:`HallucinatedCardsError` after an auditable event; afterwards the
-    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
-    Completions from non-review statuses need evidence: a stripped ``result``
-    or ``summary``, or a stripped result already stored on the card. Empty or
-    whitespace-only evidence raises :class:`EmptyCompletionError` after an
-    auditable event. Approving a card out of ``review`` stays exempt.
-    """
-    now = int(time.time())
-    # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
-    if not _parents_satisfied(conn, task_id):
+def complete_task(conn: sqlite3.Connection, task_id: str, *, result: Optional[str]=None, summary: Optional[str]=None, metadata: Optional[dict]=None, created_cards: Optional[Iterable[str]]=None, expected_run_id: Optional[int]=None, fire_lifecycle_hook: bool=True, expected_status: Optional[str]=None, expected_event_id: Optional[int]=None, force: bool=False) -> bool:
+    """Complete a phase under run/event fences; required review is not final acceptance."""
+    if not _completion_observation_matches(conn, task_id, expected_status, expected_event_id):
         return False
-    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+    now = int(time.time())
+    from hermes_cli.kanban_review_reconcile import is_owned_review_result
+    if not _parents_satisfied(conn, task_id) and not is_owned_review_result(conn, task_id, metadata, expected_run_id):
+        return False
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
-    )
-    handoff_summary = summary if summary is not None else result
+    # Upstream's _gate_empty_completion is deliberately NOT applied: the local delivery-review
+    # reconciler closes review phases without prose evidence (see test_delivery_review_reconciliation).
+    supplied_review_requirement = metadata.get('review_requirement') if isinstance(metadata, dict) and 'review_requirement' in metadata else None
+    metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=result)
+    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance  # upstream
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
+    review_parked = False
+    run_id: Optional[int] = None
     with write_txn(conn):
-        # Hard invariant even for human review approval: a parent may have
-        # reopened while this task waited.
-        if not _parents_satisfied(conn, task_id):
+        if not _completion_observation_matches(conn, task_id, expected_status, expected_event_id):
+            return False
+        if not _parents_satisfied(conn, task_id) and not is_owned_review_result(conn, task_id, metadata, expected_run_id):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
-        trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        prior_status = trow["status"] if trow else None
-        # Refuse to close a LIVE worker's run without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True); see
-        # _claim_is_live for what "live" means.
-        if expected_run_id is None and not force and trow and _claim_is_live(trow):
-            raise LiveClaimError(task_id)
-        sql = """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
-                """
-        params: tuple = (result, now, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
+        prior = conn.execute('SELECT status, current_run_id, assignee, review_requirement, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?', (task_id,)).fetchone()
+        prior_status = prior['status'] if prior else None
+        if prior is None:
             return False
+        # upstream: refuse to close a LIVE worker's run without ownership proof or force.
+        if expected_run_id is None and not force and _claim_is_live(prior):
+            raise LiveClaimError(task_id)
+        implementer = prior['assignee']
+        if prior_status == 'review':
+            parked_event = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_handoff_required' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+            if parked_event and parked_event['payload']:
+                try:
+                    parked_payload = json.loads(parked_event['payload'])
+                    if isinstance(parked_payload, dict):
+                        implementer = parked_payload.get('implementer')
+                except (TypeError, json.JSONDecodeError):
+                    pass
+        review_requirement = _merged_review_requirement(prior['review_requirement'], supplied_review_requirement)
+        review_task_id = review_requirement.get('review_task_id') if review_requirement is not None else None
+        generation_handoff = bool(review_requirement) and isinstance(metadata, dict) and ('delivery_review' in metadata)
+        if review_requirement is not None and not review_task_id and not generation_handoff:
+            adopted = _adopt_passed_review_child(conn, task_id, implementer,
+                                                 expected_head=(metadata.get("head_sha") if isinstance(metadata, dict) else None))
+            if adopted:
+                review_task_id = adopted
+                review_requirement = dict(review_requirement)
+                review_requirement['review_task_id'] = adopted
+                conn.execute("UPDATE tasks SET review_requirement = ? WHERE id = ?",
+                             (json.dumps(review_requirement, sort_keys=True), task_id))
+                _append_event(conn, task_id, 'review_child_adopted',
+                              {'review_task_id': adopted, 'implementer': implementer})
+        if review_task_id:
+            _validate_canonical_review_child(conn, task_id, review_task_id, implementer, generation_handoff=generation_handoff)
+        canonical_parent = _canonical_review_parent(conn, task_id)
+        if canonical_parent is not None:
+            parent_id, parent_requirement, parent_implementer = canonical_parent
+            current_reviewer = _canonical_assignee(prior['assignee']) if prior['assignee'] else None
+            if parent_implementer and current_reviewer == _canonical_assignee(parent_implementer):
+                raise ValueError('canonical review approval requires an independent reviewer')
+        if review_requirement is not None and (review_task_id is None or generation_handoff):
+            if prior_status == 'review':
+                return False
+            params: tuple[Any, ...]
+            run_guard = ''
+            if expected_run_id is None:
+                params = (json.dumps(review_requirement, sort_keys=True), task_id)
+            else:
+                run_guard = ' AND current_run_id = ?'
+                params = (json.dumps(review_requirement, sort_keys=True), task_id, int(expected_run_id))
+            cur = conn.execute("UPDATE tasks SET status = 'review', " + ('' if generation_handoff else 'assignee = NULL, ') + "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, review_requirement = ? WHERE id = ? AND status IN ('running', 'ready', 'blocked')" + run_guard, params)
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(conn, task_id, outcome='review_requested', status='review', summary=summary if summary is not None else result, metadata=metadata)
+            if run_id is None and (summary or metadata or result):
+                run_id = _synthesize_ended_run(conn, task_id, outcome='review_requested', summary=summary if summary is not None else result, metadata=metadata)
+            event_summary = summary if summary is not None else result
+            lines = (event_summary or '').strip().splitlines()
+            _append_event(conn, task_id, 'review_handoff_required', {'completion_kind': 'implementation_ready_for_review', 'implementer': implementer, 'owner': review_requirement['owner'], 'ready': False, 'review_task_id': review_task_id, 'summary': lines[0][:400] if lines else None}, run_id=run_id)
+            review_parked = True
+        if review_parked:
+            completion_source_status = prior_status
+        elif prior_status == 'running':
+            completion_source_status = _retry_status_for_run(conn, task_id, int(prior['current_run_id']) if prior and prior['current_run_id'] is not None else expected_run_id)
+        else:
+            completion_source_status = prior_status
+        if review_parked:
+            cur = None
+        elif expected_run_id is None:
+            cur = conn.execute("\n                UPDATE tasks\n                   SET status       = 'done',\n                       result       = ?,\n                       completed_at = ?,\n                       claim_lock   = NULL,\n                       claim_expires= NULL,\n                       worker_pid   = NULL,\n                       block_kind   = NULL,\n                       block_recurrences = 0\n                 WHERE id = ?\n                   AND status IN ('running', 'ready', 'blocked', 'review')\n                ", (result, now, task_id))
+        else:
+            cur = conn.execute("\n                UPDATE tasks\n                   SET status       = 'done',\n                       result       = ?,\n                       completed_at = ?,\n                       claim_lock   = NULL,\n                       claim_expires= NULL,\n                       worker_pid   = NULL,\n                       block_kind   = NULL,\n                       block_recurrences = 0\n                 WHERE id = ?\n                   AND status IN ('running', 'ready', 'blocked', 'review')\n                   AND current_run_id = ?\n                ", (result, now, task_id, int(expected_run_id)))
+        if not review_parked and cur.rowcount != 1:
+            return False
+        if not review_parked and isinstance(metadata, dict):
+            _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            for stored_path in metadata.pop('_staged_artifacts', []):
+                path = Path(stored_path)
+                _insert_completion_attachment(conn, task_id, filename=path.name, stored_path=str(path), size=path.stat().st_size, created_at=now)
+        if not review_parked:
+            conn.execute('UPDATE tasks SET review_requirement = ? WHERE id = ?', (json.dumps(review_requirement, sort_keys=True) if review_requirement is not None else None, task_id))
+        run_id = run_id if review_parked else _end_run(conn, task_id, outcome='completed', status='done', summary=summary if summary is not None else result, metadata=metadata)
+        if not review_parked and run_id is None and (summary or metadata or result or (prior_status == 'review')):
+            synth_summary = summary if summary is not None else result
+            synth_metadata = metadata
+            if prior_status == 'review' and (not synth_summary) and (not synth_metadata):
+                synth_summary = 'Review approved without additional evidence.'
+                synth_metadata = {'source_status': 'review', 'approval': 'manual'}
+            run_id = _synthesize_ended_run(conn, task_id, outcome='completed', summary=synth_summary, metadata=synth_metadata)
+        event_summary = summary if summary is not None else result
+        if prior_status == 'review' and (not event_summary):
+            event_summary = 'Review approved without additional evidence.'
+        _ev_lines = (event_summary or '').strip().splitlines()
+        ev_summary = _ev_lines[0][:400] if _ev_lines else ''
+        completed_payload: dict = {'result_len': len(result) if result else 0, 'summary': ev_summary or None, 'source_status': completion_source_status, 'completion_kind': 'review_approved' if canonical_parent else 'implementation_ready_for_review' if review_requirement is not None else 'review_approved' if completion_source_status == 'review' else 'final'}
+        if canonical_parent is not None and conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='delivery_review_enqueued' LIMIT 1", (task_id,)).fetchone():
+            completed_payload['completion_kind'] = 'delivery_review_result'
+            completed_payload['ready'] = False
+        if review_requirement is not None:
+            completed_payload['implementer'] = implementer
+            completed_payload['review_handoff'] = {'owner': review_requirement['owner'], 'ready': False, 'review_task_id': review_task_id}
+        elif canonical_parent is not None:
+            completed_payload['review_handoff'] = {'implementation_task_id': canonical_parent[0], 'owner': canonical_parent[1]['owner']}
+        if verified_cards:
+            completed_payload['verified_cards'] = verified_cards
         if isinstance(metadata, dict):
-            _stage_completion_artifacts(conn, task_id, metadata, now)
-        run_id = _end_run(
-            conn, task_id, outcome="completed", status="done", summary=handoff_summary,
-            metadata=metadata,
-        )
-        # Never-claimed task: synthesize a run so the handoff fields survive.
-        if run_id is None and (summary or metadata or result or prior_status == "review"):
-            synth_summary, synth_metadata = handoff_summary, metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
-                synth_summary = _REVIEW_APPROVED_NOTE
-                synth_metadata = {"source_status": "review", "approval": "manual"}
-            run_id = _synthesize_ended_run(
-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
-            )
-        event_summary = handoff_summary
-        if prior_status == "review" and not event_summary:
-            event_summary = _REVIEW_APPROVED_NOTE
-        _append_event(
-            conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
-            run_id=run_id,
-        )
-    _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
-    # Success wipes the breaker counter (history stays on the event log).
+            md_artifacts = metadata.get('artifacts')
+            if isinstance(md_artifacts, (list, tuple)):
+                cleaned_artifacts = [str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()]
+                if cleaned_artifacts:
+                    completed_payload['artifacts'] = cleaned_artifacts
+        if not review_parked:
+            _append_event(conn, task_id, 'completed', completed_payload, run_id=run_id)
+    if review_parked:
+        if fire_lifecycle_hook:
+            _fire_kanban_lifecycle_hook('kanban_task_review_requested', task_id, board=get_current_board(), assignee=None, run_id=run_id, summary=summary if summary is not None else result)
+        return True
+    scan_text = ' '.join(filter(None, [summary, result]))
+    if scan_text:
+        phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+        phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
+        if phantom_refs:
+            with write_txn(conn):
+                _append_event(conn, task_id, 'suspected_hallucinated_references', {'phantom_refs': phantom_refs, 'source': 'completion_summary'}, run_id=run_id)
     _clear_failure_counter(conn, task_id)
-    recompute_ready(conn)  # separate txn so children see ``done``
+    recompute_ready(conn)
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
-        _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
+        _fire_kanban_lifecycle_hook('kanban_task_completed', task_id, board=get_current_board(), assignee=_done_task.assignee if _done_task else None, run_id=run_id, summary=summary if summary is not None else result)
     return True
-
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
 
@@ -3278,6 +3712,11 @@ def block_task(
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
+            # Local provenance (2026-09): keep the declared kind and where it was routed from.
+            payload["routed_from"] = requested_kind
+            payload["kind"] = requested_kind
+        elif kind == "dependency":
+            payload["pending_parents"] = pending_parents(conn, task_id)
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3351,6 +3790,8 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+
+
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
@@ -3374,6 +3815,9 @@ def request_review(
     task stays ``running`` and retryable, with no attachments and no event.
     """
 
+
+
+
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
@@ -3393,10 +3837,18 @@ def request_review(
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-                "worker_started_at FROM tasks WHERE id = ?", (task_id,),
+                "worker_started_at, review_requirement FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            # Local: an explicit downstream review_requirement owns the review lane.
+            if _decode_review_requirement(trow["review_requirement"]):
+                return _ret(
+                    False,
+                    "task has an explicit downstream review_requirement; attach "
+                    "and release its canonical review child instead of switching "
+                    "to same-card review",
+                )
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
@@ -3503,6 +3955,8 @@ def _nonblank_str(value: Any) -> Optional[str]:
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
+
+
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
     gating reapplied. Returns ``(ok, implementer | reason)``."""
@@ -3536,16 +3990,27 @@ def request_changes(
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
-        # consecutive_failures deliberately PRESERVED: a review transition is
-        # not evidence the pathology cleared; only complete_task resets it.
+        # Brett, 2026-09-06: review ping-pong had NO convergence cap. One card
+        # cycled review_requested <-> changes_requested 8x in 2h, each cycle a
+        # full worker run, and never landed. After _REVIEW_CYCLE_CAP cycles the
+        # card lands in a STICKY needs_input block (auditor: review_pingpong)
+        # instead of another silent round. An operator unblock resumes it.
+        cycles = conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
+            (task_id,),
+        ).fetchone()[0]
+        capped = cycles + 1 >= _REVIEW_CYCLE_CAP
+        block_kind_sql = ", block_kind = 'needs_input'" if capped else ""
+        if capped:
+            new_status = "blocked"
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status = ?,
                    assignee = COALESCE(?, assignee),
                    claim_lock = NULL,
                    claim_expires = NULL,
-                   worker_pid = NULL, worker_started_at = NULL
+                   worker_pid = NULL, worker_started_at = NULL{block_kind_sql}
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),
@@ -3564,45 +4029,53 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                **({"review_cycle_cap": _REVIEW_CYCLE_CAP, "cycles": cycles + 1} if capped else {}),
             },
             run_id=run_id,
         )
+        if capped:
+            # Sticky (explicit-style) block so recompute_ready/autorecover leave
+            # it for a human; mirrors what kanban_block would have written.
+            _append_event(
+                conn, task_id, "blocked",
+                {"kind": "needs_input",
+                 "reason": (f"review cycle cap: {cycles + 1} review/changes rounds without "
+                            f"landing (cap {_REVIEW_CYCLE_CAP}). Reviewer and implementer are "
+                            f"not converging; needs a human decision. Latest: {reason}")},
+                run_id=run_id,
+            )
     return True, implementer
 
 
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
+    force: bool = False, dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    """Operator promotion ``todo``/``blocked``/``ready`` -> ``ready`` with an audit event.
+    Refused while a parent is unfinished unless ``force``; ``dry_run`` only
+    validates. Returns ``(ok, reason)``."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked", "ready"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked', or 'ready'"
         )
 
-    # No override: claim_task demotes ready -> todo on an undone parent whichever
-    # writer set 'ready', so a forced promotion would only report a success the
-    # first claim silently reverts (#106195). The dependency itself is the knob.
-    parents = conn.execute(
-        "SELECT t.id, t.status FROM tasks t "
-        "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ?", (task_id,),
-    ).fetchall()
-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
-    if unsatisfied:
-        return False, (
-            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
-            f"(the ready -> running claim re-checks parents, so promotion cannot "
-            f"bypass them; complete the parents or drop the link with "
-            f"`hermes kanban unlink <parent_id> {task_id}`)"
-        )
+    if not force:
+        parents = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ?", (task_id,),
+        ).fetchall()
+        unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
+        if unsatisfied:
+            return False, (
+                f"unsatisfied parent dependencies: "
+                f"{', '.join(unsatisfied)} (use --force to override)"
+            )
 
     if dry_run:
         return True, None
@@ -3610,11 +4083,14 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            "WHERE id = ? AND status IN ('todo', 'blocked', 'ready') "
+            "AND claim_lock IS NULL AND current_run_id IS NULL", (task_id,),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        _append_event(
+            conn, task_id, "promoted_manual", {"actor": actor, "reason": reason, "forced": force},
+        )
 
     return True, None
 
@@ -3682,6 +4158,23 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        # BLOCK-CONTRACT-BUDGET (2026-09-16): five identical 90-turn re-runs of one
+        # card gave up the same way each time. An unblock after "Iteration budget
+        # exhausted" changes the input: the goal budget doubles (cap 400).
+        try:
+            _last = conn.execute(
+                "SELECT error FROM task_runs WHERE task_id = ? AND outcome = 'gave_up' "
+                "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+            if _last and "Iteration budget exhausted" in (_last["error"] or ""):
+                _t = conn.execute("SELECT goal_max_turns FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                _cur = int((_t["goal_max_turns"] if _t else 0) or 0) or 90
+                _new = min(_cur * 2, 400)
+                if _new > _cur:
+                    conn.execute("UPDATE tasks SET goal_max_turns = ? WHERE id = ?", (_new, task_id))
+                    _append_event(conn, task_id, "budget_raised", {"from": _cur, "to": _new,
+                                  "reason": "unblock after iteration budget exhausted"})
+        except Exception:
+            pass
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -3694,6 +4187,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+
+
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
@@ -3729,11 +4224,58 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def _completed_artifact_evidence(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    run = latest_run(conn, task_id)
+    if run is None or run.outcome != "completed":
+        return None
+    metadata = run.metadata if isinstance(run.metadata, dict) else {}
+    review = metadata.get("delivery_review") or metadata
+    if not isinstance(review, dict):
+        return None
+    # Brett, 2026-09-07: reviewers write ``head_sha`` (plus ``base_sha``/``pr_url``);
+    # the reader only accepted ``head``, so every real PASS was invisible and no
+    # parent could ever complete. Accept the aliases the review skills emit.
+    head = next((review.get(k) for k in ("head", "head_sha", "exact_head", "pr_head")
+                 if isinstance(review.get(k), str)), None)
+    artifact = metadata.get("artifact") or metadata.get("repository")
+    if not (isinstance(artifact, str) and artifact.strip()):
+        # Brett, 2026-09-07 (zero-touch smoke t_1471440e): reviewers emit
+        # pr_url but not always repository; derive owner/repo from the PR URL.
+        pr_url = review.get("pr_url") or metadata.get("pr_url")
+        m = re.search(r"github\.com/([^/\s]+/[^/\s]+)/pull/\d+", str(pr_url or ""))
+        artifact = m.group(1) if m else artifact
+    if not (isinstance(artifact, str) and artifact.strip()):
+        # Controller verdicts intentionally contain only head/verdict/findings.
+        # Recover identity only from the candidate preceding this owned claim;
+        # a later or different-head generation cannot lend its artifact to PASS.
+        candidate = conn.execute(
+            "SELECT payload, id FROM task_events WHERE task_id = ? "
+            "AND kind = 'delivery_review_candidate' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        claimed = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, run.id),
+        ).fetchone()
+        if candidate and claimed and candidate["id"] < claimed["id"]:
+            payload = json.loads(candidate["payload"])
+            if payload.get("head") == head and payload.get("review_task") == task_id:
+                evidence = payload.get("evidence", {})
+                artifact = evidence.get("artifact_identity", evidence.get("artifact"))
+    if (review.get("verdict") != "PASS" or not isinstance(head, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or not isinstance(artifact, str) or not artifact.strip()):
+        return None
+    return {"head": head, "artifact": artifact, "run_id": run.id}
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection, task_id: str, *, author: str,
 ) -> dict[str, Any]:
     """THE done-reopen invalidation: every ``ready``/``review``/``running``/``done``
-    descendant of a reopened ancestor is demoted to ``todo`` and re-gated.
+    descendant of a reopened ancestor is re-gated. Exact-artifact PASS
+    descendants park in ``blocked`` for an explicit review decision; others
+    return to ``todo``.
     Every surface that reopens a done task (dashboard PATCH/drag) routes here.
 
     Composes under the caller's txn (``allow_nested=True``) so the flip and the
@@ -3751,6 +4293,7 @@ def invalidate_descendants_for_parent_reopen(
     caller_owns_txn = bool(conn.in_transaction)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
+    preserved: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
@@ -3773,6 +4316,15 @@ def invalidate_descendants_for_parent_reopen(
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
                 continue
+            evidence = _completed_artifact_evidence(conn, row["id"]) if previous_status == "done" else None
+            if evidence:
+                preserved.append({"id": row["id"], **evidence})
+                # Preserve the immutable run, not dependency satisfaction:
+                # a historical PASS cannot release a new generation's children.
+            # An ancestor edit is not a request to repeat an immutable PASS.
+            # Keep downstream dependencies unsatisfied until an operator names
+            # a materially changed review target through the existing lane.
+            new_status = "blocked" if evidence else "todo"
             resume_status = "ready"
             run_id = None
             if previous_status == "review":
@@ -3787,13 +4339,13 @@ def invalidate_descendants_for_parent_reopen(
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
             conn.execute(
-                "UPDATE tasks SET status = 'todo', completed_at = NULL, "
+                "UPDATE tasks SET status = ?, completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
+                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (new_status, row["id"]),
             )
             entry = {
                 "id": row["id"], "prior_status": previous_status,
-                "new_status": "todo", "resume_status": resume_status,
+                "new_status": new_status, "resume_status": resume_status,
             }
             _append_event(
                 conn, row["id"], "descendant_invalidated",
@@ -3805,15 +4357,22 @@ def invalidate_descendants_for_parent_reopen(
             _append_event(
                 conn, row["id"], "status",
                 {
-                    "status": "todo", "reason": "ancestor_reopened", "parent": task_id,
+                    "status": new_status, "reason": "ancestor_reopened", "parent": task_id,
                     "previous_status": previous_status, "resume_status": resume_status,
                 },
                 run_id=run_id,
             )
+            if evidence:
+                _append_event(conn, row["id"], "blocked", {
+                    "kind": "needs_input", "source_status": resume_status,
+                    "reason": "Historical exact-artifact PASS retained; ancestor reopen alone does not authorize another review. Resume only for a materially changed target.",
+                    "ancestor": task_id, "head": evidence["head"],
+                })
             _insert_comment(
                 conn, row["id"], author, f"Invalidated: ancestor {task_id} was reopened; "
-                f"retracted from '{previous_status}' to 'todo' "
-                f"(will resume via '{resume_status}').", now,
+                f"retracted from '{previous_status}' to '{new_status}' "
+                + ("(historical PASS retained; operator review decision required)." if evidence
+                   else f"(will resume via '{resume_status}')."), now,
             )
             invalidated.append(entry)
     if not caller_owns_txn:
@@ -3821,7 +4380,7 @@ def invalidate_descendants_for_parent_reopen(
         # Composed calls leave this to the caller post-commit.
         for pid, claim_lock, started_at in terminations:
             _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
-    return {"invalidated": invalidated, "terminations": terminations}
+    return {"invalidated": invalidated, "terminations": terminations, "preserved": preserved}
 
 
 def specify_triage_task(
@@ -3999,7 +4558,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
-    _ctx_header(lines, task)
+    _ctx_header(lines, task, conn)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
@@ -4045,7 +4604,7 @@ def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
     )
 
 
-def _ctx_header(lines: list[str], task: Task) -> None:
+def _ctx_header(lines: list[str], task: Task, conn: sqlite3.Connection) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
@@ -4064,6 +4623,18 @@ def _ctx_header(lines: list[str], task: Task) -> None:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+    if task.model_override or task.provider_override or task.reasoning_effort:
+        lines.append("## Current authorized execution route (supersedes inherited body/skill lane text)")
+        lines.append(f"Model: {task.model_override or 'profile default'}; provider: {task.provider_override or 'profile default'}; effort: {task.reasoning_effort or 'profile default'}")
+        lines.append("Do not silently substitute a different route; report any unavailable model/auth capability.")
+    candidate = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='delivery_review_candidate' ORDER BY id DESC LIMIT 1",
+        (task.id,),
+    ).fetchone()
+    if candidate:
+        lines.append("## Current controller-owned review generation (supersedes stale opening body)")
+        lines.append(_ctx_cap(candidate["payload"]))
+        lines.append("")
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))

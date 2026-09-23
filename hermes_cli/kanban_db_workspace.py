@@ -492,6 +492,25 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _fresh_base_ref(repo_root: Path) -> str:
+    """``origin/<default>`` after a bounded fetch, else ``HEAD``. BLOCK-CONTRACT-WORKTREE-BASE-DEF"""
+    head = _git(repo_root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", timeout=10)
+    ref = (head.stdout or "").strip() if head.returncode == 0 else ""
+    if not ref:
+        for cand in ("origin/main", "origin/master"):
+            if _git(repo_root, "rev-parse", "--verify", "-q", cand, timeout=10).returncode == 0:
+                ref = cand
+                break
+    if not ref:
+        return "HEAD"
+    branch = ref.split("/", 1)[1]
+    try:
+        _git(repo_root, "fetch", "--quiet", "origin", branch, timeout=90)
+    except subprocess.TimeoutExpired:
+        pass  # stale-but-present remote ref still beats the anchor HEAD
+    return ref if _git(repo_root, "rev-parse", "--verify", "-q", ref, timeout=10).returncode == 0 else "HEAD"
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -502,7 +521,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        # BLOCK-CONTRACT-WORKTREE-BASE (2026-09-16): the anchor checkout's HEAD was
+        # a June branch 1,670 commits behind main. A new card branches from the
+        # freshly fetched remote default branch; HEAD only if that is unavailable.
+        args = ["worktree", "add", "-b", branch_name, str(target), _fresh_base_ref(repo_root)]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
@@ -524,7 +546,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = _normalise_branch_name((task.branch_name or "").strip() or f"wt/{task.id}")
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
@@ -640,8 +662,29 @@ def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str)
     _set_task_column(conn, task_id, "workspace_path", str(path))
 
 
+def _normalise_branch_name(name: str) -> str:
+    """Make a task-derived branch name a valid git ref.
+
+    Brett, 2026-09-04/06 (re-anchored after the upstream split): a title ending
+    in "." produced a branch like ``.../fix-foo.`` which ``git check-ref-format``
+    rejects, so the card spawn-failed FOREVER (130 attempts on 2026-09-03).
+    Strips leading/trailing dots and slashes, collapses ``..``/``//``, drops
+    ``~^:?*[\\`` and control chars, and never returns an empty name.
+    """
+    import re as _re
+    n = (name or "").strip()
+    n = _re.sub(r"[~^:?*\[\\\x00-\x1f\x7f ]+", "-", n)
+    n = _re.sub(r"\.\.+", ".", n)
+    n = _re.sub(r"/{2,}", "/", n)
+    n = n.strip("./")
+    n = _re.sub(r"\.lock$", "", n)
+    n = _re.sub(r"/\.", "/", n)          # no path component may start with "."
+    n = _re.sub(r"\.(?=/|$)", "", n)     # ...or end with "."
+    return n or "wt"
+
+
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
-    _set_task_column(conn, task_id, "branch_name", str(branch_name))
+    _set_task_column(conn, task_id, "branch_name", _normalise_branch_name(str(branch_name)))
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

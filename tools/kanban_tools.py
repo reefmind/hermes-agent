@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import re  # ONE-CARD: block gate predicate
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -130,7 +131,8 @@ def _check(cond: Any, message: str) -> None:
 # ``session_id`` is provenance stamped by internal callers (31fe2290393), ``project_id``
 # the pre-``project`` alias still honoured by ``_handle_create`` (e7811345c17).
 _UNDECLARED_ARGS: dict[str, frozenset[str]] = {
-    "kanban_create": frozenset({"session_id", "project_id"}),
+    # review_requirement: local canonical-review wiring, passed programmatically (not model-facing).
+    "kanban_create": frozenset({"session_id", "project_id", "review_requirement"}),
     # ``title`` is the pre-schema alias of ``filename`` that ``_handle_attach_url`` still honours.
     "kanban_attach_url": frozenset({"title"}),
 }
@@ -396,10 +398,10 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override review_requirement completion_contract last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at current_run_id model_override provider_override review_requirement".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -424,6 +426,17 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # --- Goal-mode judge gate ---
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+
+
+# Shared by the goal judge and CLI goal loop; preserve explicit review contracts.
+_ONE_CARD_DOCTRINE = (
+    "Honor the task's explicit delivery and independent-review contract. Reuse "
+    "the canonical implementation and review IDs; never create duplicate continuation "
+    "cards. A self-review is not independent evidence. Review evidence must name "
+    "the exact candidate head and bounded scope. Agent review is technical evidence "
+    "only: Brett alone may approve or merge a PR. Once the required evidence and "
+    "delivery gates are satisfied, waiting for human approval is not a blocker.\n\n"
+)
 
 
 def _goal_judge_available() -> bool:
@@ -471,8 +484,8 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
-            verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+            verdict, reason, _, _, transport_failed = judge_goal(  # BLOCK-CONTRACT-JUDGE
+                goal=_ONE_CARD_DOCTRINE + f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
@@ -686,6 +699,31 @@ def _handle_list(args: dict, **kw) -> str:
             "promoted": promoted})
 
 
+def _one_card_pr_is_open(url: str) -> bool:
+    """Is this PR still open? Fails OPEN (returns True) on any doubt.
+
+    A wrong 'open' parks a finished card in the review column where Brett sees
+    it and clears it. A wrong 'closed' hides a PR that genuinely needs him. So
+    every failure mode -- gh missing, unauthenticated, offline, rate limited,
+    timeout, unparseable -- resolves to True. Only an explicit MERGED/CLOSED
+    answer sends the card to done.
+    """
+    import shutil, subprocess as _sp
+    if not shutil.which("gh"):
+        return True
+    try:
+        proc = _sp.run(["gh", "pr", "view", url, "--json", "state"],
+                       capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            return True
+        return str(json.loads(proc.stdout or "{}").get("state", "")).upper() == "OPEN"
+    except Exception:
+        return True
+
+
+_ONE_CARD_PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+
+
 @_kanban_handler("kanban_complete")
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -709,7 +747,13 @@ def _handle_complete(args: dict, **kw) -> str:
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        from hermes_cli.kanban_review_reconcile import is_phase_submission
+        phase_handoff = is_phase_submission(conn, task, metadata)
+        # A generation handoff/result is not a claim that the whole goal is done.
+        # The kernel fences ownership; the controller validates evidence and
+        # releases the existing reviewer before evaluating final delivery gates.
+        if not phase_handoff:
+            _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
@@ -772,6 +816,113 @@ def _handle_complete(args: dict, **kw) -> str:
                        for a in kb.list_attachments(conn, tid)])
 
 
+# ONE-CARD: reasons that are NOT a decision for Brett. Each pattern names a
+# stall observed on 2026-09-08 that parked a card for days.
+# BLOCK-CONTRACT-CHECKER (2026-09-15)
+_BLOCK_CONTRACT_TEMPLATE = (
+    "kanban_block reason MUST use one of these shapes (every line matters):\n"
+    "\n"
+    "WHAT I NEED: <one sentence, imperative, addressed to Brett>\n"
+    "WHY: <one sentence: what you tried and the literal error/URL>\n"
+    "DO THIS:\n"
+    "  1. <exact step: URL to open / secret NAME and where to set it / file to upload / command>\n"
+    "  2. <next step, if any>\n"
+    "\n"
+    "-- or, when the card cannot be done as written --\n"
+    "CANNOT DO: <one sentence>\n"
+    "WHY: <evidence, verified live>\n"
+    "OPTIONS:\n"
+    "  1. <close the card>\n"
+    "  2. <alternative scope>\n"
+    "\n"
+    "-- or, when only a product decision is missing --\n"
+    "DECISION NEEDED: <one sentence>\n"
+    "WHY: <what depends on it>\n"
+    "QUESTIONS:\n"
+    "  1. <question answerable in one line>\n"
+    "\n"
+    "Forbidden as the first line: 'waiting on human', 'needs input', 'operator held', "
+    "'reassign', 'reconcile', 'awaiting'. If you cannot name a concrete step, you are not "
+    "blocked: keep working, or open the PR describing the limitation and complete."
+)
+_BLOCK_CONTRACT_HEADS = ("WHAT I NEED:", "CANNOT DO:", "DECISION NEEDED:")
+_BLOCK_CONTRACT_LIST = {"WHAT I NEED:": "DO THIS:", "CANNOT DO:": "OPTIONS:",
+                        "DECISION NEEDED:": "QUESTIONS:"}
+_BLOCK_CONTRACT_FORBIDDEN = re.compile(
+    r"waiting (?:on|for) (?:a )?human|needs? (?:human )?input|operator[- ]held|"
+    r"\breassign|reconcil|awaiting (?:brett|human|operator|input)|manual intervention",
+    re.I)
+
+
+def _block_contract_refusal(reason: str):
+    """None when *reason* follows the block contract; else the refusal text."""
+    lines = [ln.strip() for ln in (reason or "").splitlines() if ln.strip()]
+    if not lines:
+        return "kanban_block refused: empty reason.\n" + _BLOCK_CONTRACT_TEMPLATE
+    head = lines[0].upper()
+    shape = next((h for h in _BLOCK_CONTRACT_HEADS if head.startswith(h)), None)
+    if shape is None:
+        return ("kanban_block refused: the first line must start with WHAT I NEED:, "
+                "CANNOT DO:, or DECISION NEEDED:.\n" + _BLOCK_CONTRACT_TEMPLATE)
+    if _BLOCK_CONTRACT_FORBIDDEN.search(lines[0]):
+        return ("kanban_block refused: the first line names no concrete thing. Say what "
+                "Brett must open, provide, set, upload, or decide.\n" + _BLOCK_CONTRACT_TEMPLATE)
+    if not any(ln.upper().startswith("WHY:") for ln in lines[1:]):
+        return "kanban_block refused: missing WHY: line.\n" + _BLOCK_CONTRACT_TEMPLATE
+    list_head = _BLOCK_CONTRACT_LIST[shape]
+    try:
+        li = next(i for i, ln in enumerate(lines) if ln.upper().startswith(list_head))
+    except StopIteration:
+        return f"kanban_block refused: missing {list_head} section.\n" + _BLOCK_CONTRACT_TEMPLATE
+    steps = [ln for ln in lines[li + 1:] if re.match(r"^\d+[.)]\s+\S", ln)]
+    if not steps:
+        return (f"kanban_block refused: {list_head} needs at least one numbered, concrete "
+                f"item.\n" + _BLOCK_CONTRACT_TEMPLATE)
+    return None
+
+
+_ONE_CARD_NOT_A_BLOCKER = (
+    (r'reassign|wrong (?:profile|role)|(?:frontend|backend|integrator) (?:role|profile) (?:cannot|can\'t|explicitly)|'
+     r'not (?:my|this) (?:role|profile)|capable owner',
+     "a profile name is a label, not a permission. Do the work on this card with the "
+     "tools you have."),
+    (r'validator|lifecycle validator|goal judge|completion judge|protocol violation|contract mismatch',
+     "board validators are not blockers. Complete with the evidence you have; the kernel "
+     "tells you exactly what the judge wants if it rejects."),
+    (r'test|spec|suite|ci\b|pipeline|lint|typecheck|coverage',
+     "a failing test or red CI never blocks a card. Record it in the PR body under a "
+     "'Known test failures' heading, say whether your change caused it, and keep going."),
+
+    (r'preflight|executor|model|quota|usage limit|429|fable|opus|sonnet|codex',
+     "executor identity, model choice and preflight quota are not blockers. Use the "
+     "executor you have and note it in the PR body."),
+
+    (r'schedul|defer|later|wait until|cron',
+     "there is no scheduler. Run now against what is available and state the window you "
+     "used as an assumption in the PR body."),
+)
+
+
+def _one_card_block_refusal(reason: str):
+    """Refusal text when *reason* is not a decision only a human can make.
+
+    Fails OPEN on anything unrecognised: a genuinely novel blocker still parks the
+    card. It only refuses the five shapes that were observed parking cards for days.
+    A reason that also names a credential / access / product decision is always
+    allowed through, because those are real even when a test is failing too.
+    """
+    text = (reason or '').lower()
+    if re.search(r'credential|secret|token|api key|password|auth login|webhook url|'
+                 r'screenshot|physical|hardware|device|product decision|which |should we |'
+                 r'no (?:official|supported|public) api|does not exist|no such api', text):
+        return None
+    for pattern, guidance in _ONE_CARD_NOT_A_BLOCKER:
+        if re.search(pattern, text):
+            return (f"kanban_block refused: that is not a decision for a human. {guidance} "
+                    f"If you truly need Brett, say plainly what he must provide or decide.")
+    return None
+
+
 @_kanban_handler("kanban_block")
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
@@ -779,6 +930,21 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    # ONE-CARD: block gate (2026-09-08). A block must be a decision only Brett
+    # can make -- a missing credential, a missing product decision, a physical
+    # action no agent can perform. Everything else the worker decides itself and
+    # writes into the PR body as a stated assumption. A failing test NEVER
+    # blocks a card: it goes under a 'Known test failures' heading and the work
+    # continues. 'dependency' is gone with the dependency graph.
+    _check(kind != "dependency",
+           "kind='dependency' no longer exists: cards have no dependencies. Do the "
+           "work on this card, or finish it and create an independent card.")
+    _refusal = _one_card_block_refusal(reason)
+    _check(_refusal is None, _refusal or "")
+    # BLOCK-CONTRACT-GATE (2026-09-15): a block must tell Brett exactly what to
+    # do, in a fixed shape, or it is refused with the template.
+    _contract = _block_contract_refusal(reason)
+    _check(_contract is None, _contract or "")
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
@@ -852,6 +1018,10 @@ def _handle_request_review(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
+    # Structured canonical pairs use the same owned phase-submission path as
+    # complete; never reassign the implementation card to its child reviewer.
+    if isinstance(metadata, dict) and "delivery_review" in metadata:
+        return _handle_complete({**args, "summary": summary, "metadata": metadata})
     if reviewer:
         from hermes_cli.profiles import list_profile_names, profile_exists
 
@@ -861,7 +1031,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        # Requesting review cannot require review to have already passed.
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
@@ -1072,7 +1242,22 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
-    with _board(args.get("board")) as (kb, conn):
+    # Brett, 2026-09-04/06 (re-anchored after the upstream split): a card created
+    # from a Discord guild lands on THAT guild's board via kanban.board_by_discord_guild,
+    # instead of whatever board the gateway process currently points at.
+    _board_arg = args.get("board")
+    if not _board_arg:
+        try:
+            from gateway.session_context import get_session_env as _env
+            if (_env("HERMES_SESSION_PLATFORM", "") or "").lower() == "discord":
+                from hermes_cli.config import load_config_readonly as _lcr
+                _map = (_lcr() or {}).get("kanban", {}).get("board_by_discord_guild") or {}
+                _scope = str(_env("HERMES_SESSION_SCOPE_ID", "") or "").strip()
+                if _scope and str(_scope) in {str(k) for k in _map}:
+                    _board_arg = {str(k): v for k, v in _map.items()}[_scope]
+        except Exception:
+            _board_arg = args.get("board")
+    with _board(_board_arg) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
@@ -1102,6 +1287,7 @@ def _handle_create(args: dict, **kw) -> str:
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
+            review_requirement=args.get("review_requirement"),
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
@@ -1227,8 +1413,8 @@ _TOOLS = (
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_schedule", KANBAN_SCHEDULE_SCHEMA, _handle_schedule, "⏰"),
-    ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
-    ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
+    ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "🔎"),
+    ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "🔎"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
     ("kanban_comment", KANBAN_COMMENT_SCHEMA, _handle_comment, "💬"),
     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
@@ -1236,7 +1422,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+)
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -103,6 +104,8 @@ class DispatchResult:
     is
     """
 
+    capacity_hold: Optional[dict] = None
+    delivery_holds: list[tuple[str, str]] = field(default_factory=list)
     reclaimed: int = 0
     promoted: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
@@ -1143,6 +1146,82 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+# BLOCK-CONTRACT-QUOTA-DEF (2026-09-16). A worker that hits a provider quota
+# wall usually ends its turn gracefully (rc=0) after the agent loop gives up,
+# which the reaper reads as a protocol violation and parks the card as
+# operator-held 'needs input'. Nobody can act on that. Read the worker log: a
+# rate-limit signature turns the exit into the existing ``rate_limited`` shape
+# (no failure counted, quota cooldown before the next spawn).
+_QUOTA_LOG_RE = re.compile(r"usage_limit_reached|HTTP 429|RateLimitError|Rate limited after|rate limit", re.I)
+
+
+def _rate_limit_signature_in_log(task_id: str, tail_bytes: int = 65536) -> Optional[str]:
+    import glob as _glob
+    from pathlib import Path as _Path
+    paths: list = []
+    try:
+        paths.append(_kb.worker_logs_dir() / f"{task_id}.log")
+    except Exception:
+        pass
+    paths += [_Path(p) for p in _glob.glob(os.path.expanduser(f"~/.hermes/kanban/boards/*/logs/{task_id}.log"))]
+    for path in paths:
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - tail_bytes))
+                tail = fh.read().decode("utf-8", "ignore")
+        except Exception:
+            continue
+        hit = _QUOTA_LOG_RE.search(tail)
+        if hit:
+            reset = re.search(r"resets_in_seconds['\"]?:\s*(\d+)", tail)
+            hours = f" (resets in ~{int(reset.group(1)) // 3600}h)" if reset else ""
+            return f"provider quota: {hit.group(0)}{hours}"
+    return None
+
+
+def _rate_limit_reset_seconds(task_id: str) -> Optional[int]:
+    """``resets_in_seconds`` from the worker log tail, or None. BLOCK-CONTRACT-QUOTA-RESET-DEF"""
+    import glob as _glob
+    paths = [str(_kb.worker_logs_dir() / f"{task_id}.log")]
+    paths += _glob.glob(os.path.expanduser(f"~/.hermes/kanban/boards/*/logs/{task_id}.log"))
+    for path in paths:
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 65536))
+                tail = fh.read().decode("utf-8", "ignore")
+        except Exception:
+            continue
+        m = re.search(r"resets_in_seconds['\"]?:\s*(\d+)", tail)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _reclassify_quota_clean_exit(dead: "_DeadWorker", task_id: str) -> "_DeadWorker":
+    if not dead.protocol_violation:
+        return dead
+    signature = _rate_limit_signature_in_log(task_id)
+    if not signature:
+        return dead
+    pid = dead.event_payload.get("pid")
+    return _DeadWorker(
+        "rate_limited", dead.code,
+        f"pid {pid} ended after a {signature} — requeued without counting a failure; quota cooldown applies",
+        "rate_limited",
+        {"pid": pid, "claimer": dead.event_payload.get("claimer"), "exit_code": dead.code, "quota": signature,
+         # BLOCK-CONTRACT-QUOTA-UNTIL-SET: provider reset time (capped at 7 days) so the
+         # respawn guard can hold the card instead of probing every 5 minutes.
+         "rate_limit_until": int(time.time()) + min(_rate_limit_reset_seconds(task_id) or 0, 7 * 86400),
+         # KANBAN-CLAUDE-CLI-QUOTA-LANE: which lane hit the wall (see the respawn guard).
+         "executor": __import__("hermes_cli.kanban_db_claude_cli", fromlist=["x"]).resolve_worker_executor()},
+        rate_limited=True,
+    )
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
@@ -1167,14 +1246,22 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            dead = _reclassify_quota_clean_exit(dead, row["id"])  # BLOCK-CONTRACT-QUOTA-CALL
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            # A clean exit without the lifecycle handoff is not permission
+            # to spend another worker run. Only quota cooldown is automatic.
+            genuine_crash = not dead.rate_limited
+            target_status = "blocked" if genuine_crash else retry_status
+            if genuine_crash:
+                dead.event_payload["operator_held"] = True
+                dead.event_payload["error"] = dead.error_text[:500]
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (target_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -1209,7 +1296,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                if dead.protocol_violation:
+                    sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                else:
+                    conn.execute("UPDATE tasks SET last_failure_error = ?, consecutive_failures = consecutive_failures + 1 WHERE id = ?", (dead.error_text[:500], row["id"]))
+                _kb._append_event(conn, row["id"], "blocked", {"reason": dead.error_text[:500], "kind": "needs_input", "source_status": retry_status, "operator_held": True}, run_id=run_id)
     return sweep
 
 
@@ -1239,8 +1330,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
             )
             if streak < violation_limit:
-                # Below budget: already back at ``ready`` with the error stamped.
-                # No ``_record_task_failure`` — must not consume the unified budget.
+                # Below budget: remains operator-held with the error stamped.
+                # Explicit operator continuations still count toward this budget.
                 continue
             # ``force_trip``: the decision (incl. per-task ``max_retries``) was
             # already made against the violation streak above.
@@ -1522,6 +1613,124 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+
+
+#: Only explicit lifecycle actions grant continuation. Automatic promotion and
+#: stale recovery must not manufacture a fresh authorization after a claim.
+_EXPLICIT_REQUEUE_KINDS = (
+    "status", "promoted_manual", "unblocked", "reclaimed",
+    "changes_requested", "review_reopened",
+    "delivery_changes_requested", "delivery_review_enqueued",
+)
+
+
+def _is_explicit_requeue(event: sqlite3.Row) -> bool:
+    try:
+        payload = json.loads(event["payload"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    kind = event["kind"]
+    if kind in {"delivery_changes_requested", "delivery_review_enqueued"}:
+        return bool(event["run_id"] and payload.get("transition") and payload.get("head"))
+    if kind == "reclaimed":
+        return payload.get("manual") is True
+    if kind == "status":
+        # Dashboard status changes include the requested status even when the
+        # actual landing is todo because a parent has not completed yet.
+        return payload.get("requested_status", payload.get("status")) == "ready"
+    if kind == "promoted_manual":
+        return bool(payload.get("actor"))
+    if kind == "changes_requested":
+        # request_changes validates review-run ownership and handoff provenance
+        # before writing this event. Bare/legacy synthetic events fail closed.
+        return (
+            bool(event["run_id"] and payload.get("implementer"))
+            and payload.get("status") in {"ready", "todo"}
+        )
+    if kind in {"unblocked", "review_reopened"}:
+        return (
+            payload.get("status", "ready") in {"ready", "todo"}
+            and payload.get("resume_status", "ready") == "ready"
+        )
+    return False
+
+
+def _authorized_continuation_at(
+    conn: sqlite3.Connection, task_id: str, *, since: int,
+    comment_id: Optional[int] = None,
+    after_event_id: Optional[int] = None,
+) -> Optional[int]:
+    """Unspent authorization after a PR comment/completion (one claim only).
+
+    New comments carry their comment_id in the same transaction's event, so
+    event ids unambiguously order comment/requeue/claim even within one second.
+    Legacy comments without that marker retain a strict timestamp comparison:
+    an ambiguous tie is never treated as permission. Automatic promotions may
+    release a real parent gate, but cannot replenish a spent authorization.
+    """
+    anchor_id = after_event_id
+    if comment_id is not None:
+        anchor = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
+            "AND json_valid(payload) AND json_extract(payload, '$.comment_id') = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, comment_id),
+        ).fetchone()
+        if anchor is not None:
+            anchor_id = int(anchor["id"])
+    consuming = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? "
+        "AND kind IN ('claimed', 'spawned')", (task_id,),
+    ).fetchone()[0] or 0
+    placeholders = ",".join("?" for _ in _EXPLICIT_REQUEUE_KINDS)
+    for event in conn.execute(
+        "SELECT id, kind, payload, run_id, created_at FROM task_events "
+        f"WHERE task_id = ? AND id > ? AND kind IN ({placeholders}) "
+        "ORDER BY id DESC",
+        (task_id, max(consuming, anchor_id or 0), *_EXPLICIT_REQUEUE_KINDS),
+    ).fetchall():
+        if anchor_id is None and int(event["created_at"]) <= since:
+            continue
+        if _is_explicit_requeue(event):
+            return int(event["created_at"])
+    return None
+
+
+def _stamp_respawn_guard_event(
+    conn: sqlite3.Connection, task_id: str, reason: str,
+) -> bool:
+    """Record a ``respawn_guarded`` event, deduped. True if one was written.
+
+    The hold has to be visible in ``hermes kanban tail`` — a silently skipped
+    task is the same failure shape as a monitor that never reports. But the
+    dispatcher ticks about once a minute, and re-stamping an identical hold
+    every tick buries the task's real history under thousands of duplicate
+    rows within a day (an ``active_pr`` hold runs for a 24h window).
+
+    So: write only when this is genuinely new information — the most recent
+    event on the task is not already the same hold. A different reason, or any
+    other event in between (a comment, a re-queue, a claim), makes the hold
+    news again and it is re-stamped once.
+    """
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is not None and last["kind"] == "respawn_guarded":
+        try:
+            prev = json.loads(last["payload"] or "{}")
+        except (TypeError, ValueError):
+            prev = {}
+        if prev.get("reason") == reason:
+            return False
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason})
+    return True
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1559,7 +1768,7 @@ def check_respawn_guard(
     #    reaches the breaker.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at, metadata FROM task_runs "
+        "SELECT outcome, ended_at, metadata FROM task_runs "  # BLOCK-CONTRACT-QUOTA-UNTIL-SELECT
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
@@ -1571,15 +1780,34 @@ def check_respawn_guard(
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
+            # Cooldown disabled — respawn immediately, and skip the
+            # blocker_auth regex so the stamped rate-limit text doesn't
+            # re-trap the task.
             return None
+        # KANBAN-CLAUDE-CLI-QUOTA-LANE (local, 2026-09-22): a quota wall belongs to
+        # the lane that hit it. A ChatGPT/Codex cap on the native lane must not hold
+        # a card the claude_cli lane (Claude subscription) will run, or vice versa.
+        # Runs recorded before the stamp existed were native — the only lane then.
+        _rl_meta = _kb._json_dict(latest_run["metadata"]) or {}
+        from hermes_cli import kanban_db_claude_cli as _ccli
+        if (_rl_meta.get("executor") or _ccli.WORKER_EXECUTOR_HERMES) != _ccli.resolve_worker_executor():
+            return None
+        # BLOCK-CONTRACT-QUOTA-UNTIL-CHECK: a recorded provider reset time wins over
+        # the flat cooldown.
+        try:
+            _until = int(_rl_meta.get("rate_limit_until") or 0)
+        except Exception:
+            _until = 0
+        if _until and now < _until:
+            return "rate_limit_cooldown"
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        # Cooldown elapsed — allow the respawn. Return early so the
+        # blocker_auth check below doesn't catch the rate-limit text we
+        # stamped on the task; this path intentionally retries forever
+        # (cheaply, spaced by the cooldown) until quota returns or a real
+        # crash/completion supersedes it.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
@@ -1591,32 +1819,38 @@ def check_respawn_guard(
     if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
-    # Review-lane spawns stop here: a recent completed run and a fresh PR URL
-    # are the canonical *inputs* to a review handoff, not duplicate-work signals.
+
+
+    # Review-lane spawns stop here: a recent completed run and a fresh PR
+    # URL comment are the canonical *inputs* to a review handoff (worker
+    # opened a PR, then requested review), not signals of duplicate work.
     if lane == "review":
         return None
 
-    # 3. Completed run within guard window. Exception: an explicit re-queue
-    #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
-    #    a deliberate "run it again" — otherwise a manual done→ready would sit
-    #    silently held until the window elapses.
+    # 3. Completed run within guard window — proof of recent success.
+    #    Exception: an explicit re-queue AFTER that success (an operator
+    #    dragging done→ready, a manual promotion, an unblock, a
+    #    manual reclaim or review findings) is a deliberate "run it again" — honor it instead of
+    #    deferring. Without this, a manual done→ready just sits there,
+    #    silently held by the guard, until the window elapses.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
-        "SELECT ended_at FROM task_runs "
+        "SELECT id, ended_at FROM task_runs "
         "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id, cutoff),
     ).fetchone()
     if recent_completed:
         completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, completed_at),
+        completed_event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+            (task_id, recent_completed["id"]),
         ).fetchone()
-        if not requeued_after:
+        if _authorized_continuation_at(
+            conn, task_id, since=completed_at,
+            after_event_id=int(completed_event["id"]) if completed_event else None,
+        ) is None:
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
@@ -1627,12 +1861,36 @@ def check_respawn_guard(
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
+        "SELECT id, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+            continue
+        # The URL alone only proves a PR was OPENED, not that it is still
+        # open. Without the liveness check below, a task stays parked for
+        # the full 24h window even after its PR is merged or closed —
+        # observed 2026-08-16: t_9228cc88 held by PR #3109, which was
+        # already CLOSED, while the board showed a bare "Spawned: 0".
+        #
+        # Fail-safe by construction: ONLY an explicit CLOSED/MERGED answer
+        # releases the guard. Any failure — gh missing, not authenticated,
+        # rate limited, offline, timeout, unparseable — falls through and
+        # keeps guarding, i.e. exactly the old behaviour.
+        # An explicit re-queue that landed AFTER this PR comment is a
+        # deliberate "continue the same card / same PR" request — the
+        # operator dragging it back to ready, an unblock, a manual
+        # promotion, or a review returning findings to the implementation
+        # card. Before this, ``active_pr`` was the one guard reason with no
+        # override at all: an explicitly requeued implementation card with
+        # a Draft PR stayed parked for the full 24h window while
+        # ``dispatch`` reported a bare "Spawned: 0", and ``unblock`` could
+        # not free it. See ``_authorized_continuation_at`` for why this
+        # stays bounded to ONE spawn per authorization.
+        if _authorized_continuation_at(
+            conn, task_id, since=int(c["created_at"] or 0), comment_id=int(c["id"])
+        ) is not None:
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
@@ -2022,6 +2280,38 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _delivery_role_hold(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
+    """Validate explicitly typed delivery handoffs; never infer a role from PR prose.
+
+    This check can only hold work, never authorize a retry or satisfy a gate.
+    Legacy untyped cards retain their existing dispatch semantics.
+    """
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id=? AND json_valid(metadata) "
+        "AND json_type(metadata, '$.delivery_dispatch') IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    contract = json.loads(row["metadata"]).get("delivery_dispatch")
+    if not isinstance(contract, dict):
+        return "delivery dispatch contract must be an object"
+    capabilities = {"open_pr_remediation": {"pr_head"}, "post_merge_validation": {"merged_checkout"}}
+    role, phase = contract.get("role"), contract.get("phase")
+    if contract.get("assignee") != assignee:
+        return "delivery role binding no longer matches assignee; update the explicit handoff"
+    if not isinstance(role, str) or not isinstance(phase, str):
+        return "delivery role and phase must be strings"
+    if role not in capabilities or phase not in capabilities[role]:
+        return f"incompatible delivery phase/role: {phase}/{role}; select a compatible worker"
+    target = contract.get("validation_target")
+    if not isinstance(target, dict) or target.get("kind") != phase:
+        return "delivery validation target must distinguish PR head from merged checkout"
+    if not isinstance(target.get("commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", target["commit"]):
+        return "delivery validation target requires an exact commit"
+    return None
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2070,6 +2360,12 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    role_hold = _delivery_role_hold(conn, task_id, assignee)
+    if role_hold:
+        result.delivery_holds.append((task_id, role_hold))
+        if not dry_run:
+            _stamp_respawn_guard_event(conn, task_id, role_hold)
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2081,8 +2377,7 @@ def _dispatch_lane_task(
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+            _stamp_respawn_guard_event(conn, task_id, guard_reason)
         return False
 
     def _count_spawn(name: str) -> None:
@@ -2232,12 +2527,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.capacity_hold = {"scope": "board", "running": running_count, "limit": max_spawn}
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_hold = {"scope": "host", "running": total_running, "limit": max_in_progress}
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -2268,11 +2565,14 @@ def _tick_spawn_budget(
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
-    return conn.execute(
+    rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    if status == "review":
+        return [row for row in rows if _kb.review_task_dispatchable(conn, row["id"])]
+    return rows
 
 
 def _any_spawnable_review(
@@ -2325,6 +2625,46 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
+# BLOCK-CONTRACT-PR-CAP-DEF (2026-09-16). Brett and Meghann are the only
+# approvers; every open agent PR beyond what they can review that week is
+# worker time that rots into merge conflicts. Above the cap (recent, non-draft
+# PRs) the board stops spawning until the queue drains. Fails open on error.
+_PR_CAP_REPOS = {"reefmind": "millermindsolutions-com/reefmind-project",
+                 "menubridge": "millermindsolutions-com/dealer-dms-menu-bridge"}
+_PR_CAP_CACHE: dict = {}
+
+
+def _open_pr_cap_exceeded(board: Optional[str]) -> bool:
+    import shutil as _shutil, subprocess as _sp, datetime as _dt
+    repo = _PR_CAP_REPOS.get(str(board or "").lower())
+    if not repo:
+        return False
+    try:
+        cap = int(os.environ.get("HERMES_KANBAN_OPEN_PR_CAP", "10"))
+    except ValueError:
+        cap = 10
+    if cap <= 0:
+        return False
+    now = time.time()
+    hit = _PR_CAP_CACHE.get(repo)
+    if hit and now - hit[0] < 120:
+        count = hit[1]
+    else:
+        gh = _shutil.which("gh") or "/opt/homebrew/bin/gh"
+        try:
+            out = _sp.run([gh, "pr", "list", "-R", repo, "--state", "open", "--limit", "100",
+                           "--json", "isDraft,createdAt"], capture_output=True, text=True, timeout=20).stdout
+            cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=14)).isoformat()
+            count = sum(1 for p in json.loads(out or "[]") if not p.get("isDraft") and p.get("createdAt", "") >= cutoff)
+        except Exception:
+            return False
+        _PR_CAP_CACHE[repo] = (now, count)
+    if count > cap:
+        __import__("logging").getLogger(__name__).info("kanban dispatcher [%s]: %d recent open agent PRs > cap %d — holding new spawns until the queue drains", board, count, cap)
+        return True
+    return False
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -2350,10 +2690,14 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    from hermes_cli.kanban_review_reconcile import reconcile
+    managed_review_parents, result.delivery_holds = reconcile(conn)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
     if not may_spawn:
+        return result
+    if _open_pr_cap_exceeded(board):  # BLOCK-CONTRACT-PR-CAP-CALL
         return result
 
     ready_rows = _lane_rows(conn, "ready")
@@ -2418,11 +2762,51 @@ def _dispatch_once_locked(
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
     # checks the FULL shared ``spawn_budget`` — the reservation above caps the
     # ready lane, it grants no extra capacity here.
+    # Brett, 2026-09-07: self-heal orphaned review cards. The canonical-review
+    # handoff used to write assignee = NULL on the parent, so after the child's
+    # PASS the parent sat in `review` as skipped_unassigned forever (proof card
+    # t_d197a6b5). Resolve the implementer from the handoff event and persist it.
     for row in review_rows:
+        if not row["assignee"]:
+            try:
+                ev = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_handoff_required' "
+                    "ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+                impl = (_kb._json_dict(ev["payload"]).get("implementer") if ev else None) or None
+                if impl:
+                    with _kb.write_txn(conn):
+                        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ? AND status = 'review' AND assignee IS NULL",
+                                     (impl, row["id"]))
+                        _kb._append_event(conn, row["id"], "assignee_restored", {"assignee": impl, "reason": "orphaned review card"})
+                    row = dict(row); row["assignee"] = impl
+            except Exception:
+                pass
+        if row["id"] in managed_review_parents:
+            continue
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        # Brett, 2026-09-07 (zero-touch smoke t_1471440e): once the implementer
+        # stays owner of a card in `review`, the review lane re-dispatched it
+        # every tick WHILE its independent review child was still running —
+        # handoff -> reclaim -> handoff until the worker escalated and blocked.
+        # A parent in review waits for its linked review child to be terminal.
+        try:
+            pending = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks c ON c.id = l.child_id "
+                "WHERE l.parent_id = ? AND c.status IN "
+                "('todo','ready','running','review','blocked','triage','scheduled') "
+                "AND lower(c.title) LIKE '%review%' LIMIT 1", (row["id"],)).fetchone()
+        except Exception:
+            pending = None
+        if pending is not None:
+            if not hasattr(result, "skipped_review_pending"):
+                try: result.skipped_review_pending = []
+                except Exception: pass
+            try: result.skipped_review_pending.append(row["id"])
+            except Exception: pass
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
@@ -2777,6 +3161,35 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     return cmd
 
 
+_LOG_STAMPER_SRC = (
+    "import sys,time\n"
+    "o=sys.stdout.buffer\n"
+    "def ts(): return time.strftime('%Y-%m-%dT%H:%M:%SZ ', time.gmtime()).encode()\n"
+    "o.write(ts()+b'=== worker run start ('+sys.argv[1].encode()+b')\\n'); o.flush()\n"
+    "for line in sys.stdin.buffer:\n"
+    "    o.write(ts()+line); o.flush()\n"
+    "o.write(ts()+b'=== worker output closed\\n'); o.flush()\n"
+)
+
+
+def _spawn_log_stamper(log_f, task_id: str):
+    """Detached process that prefixes each worker output line with UTC time and
+    appends it to ``log_f``. Returns None (caller falls back to the bare file)
+    if it cannot start. BLOCK-CONTRACT-LOG-STAMP-DEF"""
+    if os.environ.get("HERMES_KANBAN_LOG_STAMP", "1") in ("0", "false", "no"):
+        return None
+    try:
+        return subprocess.Popen(  # noqa: S603
+            [sys.executable, "-u", "-c", _LOG_STAMPER_SRC, task_id],
+            stdin=subprocess.PIPE, stdout=log_f, stderr=subprocess.STDOUT,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+        )
+    except Exception as exc:
+        __import__("logging").getLogger(__name__).warning("kanban dispatcher: log stamper unavailable (%s); writing unstamped log", exc)
+        return None
+
+
 def _open_worker_log(task: Task, board: Optional[str]):
     """Append-mode per-task log (a re-run on unblock appends, never overwrites),
     rotated first. Anchored at the board root (not the shared kanban root) so
@@ -2937,10 +3350,24 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # The module argv must carry the import context that made it resolvable:
-    # the shim's in-process path injection is invisible to the bare child.
-    _propagate_module_import_root(cmd, env)
+    # KANBAN-CLAUDE-CLI-SPAWN (local, 2026-09-22): `kanban.worker_executor:
+    # claude_cli` runs `claude -p` on the Claude subscription. goal_mode cards
+    # stay native: the goal judge loop only exists in cli.py's quiet branch.
+    from hermes_cli import kanban_db_claude_cli as _ccli
+    kanban_cfg = _ccli.load_kanban_config()
+    executor = _ccli.resolve_worker_executor(kanban_cfg)
+    if executor == _ccli.WORKER_EXECUTOR_CLAUDE_CLI and task.goal_mode:
+        executor = _ccli.WORKER_EXECUTOR_HERMES
+    if executor == _ccli.WORKER_EXECUTOR_CLAUDE_CLI:
+        # Build before mutating env / opening the log so a rejected spawn
+        # leaves nothing half-applied.
+        cmd = _ccli.build_command(task, workspace, kanban_cfg)
+        stripped_env = _ccli.apply_claude_cli_env(env)
+    else:
+        cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+        # The module argv must carry the import context that made it resolvable:
+        # the shim's in-process path injection is invisible to the bare child.
+        _propagate_module_import_root(cmd, env)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
@@ -2948,25 +3375,51 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
+    if executor == _ccli.WORKER_EXECUTOR_CLAUDE_CLI:
+        log_f.write(_ccli.log_header(cmd, stripped_env, env, env["HERMES_KANBAN_BOARD"], profile_arg))
+        log_f.flush()
+    # BLOCK-CONTRACT-LOG-STAMP (2026-09-16): worker logs carried no timestamps, so
+    # "claim -> first tool call -> PR" latency was unmeasurable. Output now flows
+    # through a detached stamper process that prefixes every line with UTC time.
+    # A separate process (not a dispatcher thread) so a gateway restart cannot
+    # close the pipe under a running worker.
+    stamper = _spawn_log_stamper(log_f, task.id)
+    gate = (
+        _ccli.spawn_gate(kanban_cfg)
+        if executor == _ccli.WORKER_EXECUTOR_CLAUDE_CLI
+        else contextlib.nullcontext()
+    )
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
-        )
-    except FileNotFoundError:
+        with gate:
+            proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=stamper.stdin if stamper is not None else log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+            )
+    except OSError as exc:
+        if stamper is not None and stamper.stdin is not None:
+            stamper.stdin.close()
         log_f.close()
+        if executor == _ccli.WORKER_EXECUTOR_CLAUDE_CLI:
+            raise RuntimeError(
+                f"Claude Code CLI ({cmd[0]!r}) could not be executed for kanban task "
+                f"{task.id}: {exc}. kanban.worker_executor is {executor!r}."
+            ) from exc
+        if not isinstance(exc, FileNotFoundError):
+            raise
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
+    if stamper is not None and stamper.stdin is not None:  # BLOCK-CONTRACT-LOG-STAMP-CLOSE
+        stamper.stdin.close()  # only the worker holds the write end now
     if _kb._IS_WINDOWS:
         _live_worker_procs[proc.pid] = proc
     return proc.pid

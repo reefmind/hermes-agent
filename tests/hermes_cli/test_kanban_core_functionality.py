@@ -414,6 +414,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kbd.detect_crashed_workers(conn) == [tid]
 
+        assert kb.unblock_task(conn, tid)
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
         assert run2.id != run1.id
@@ -1253,26 +1254,25 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     try:
         tid = kb.create_task(conn, title="mixed", assignee="worker")
 
-        # One real crash: unified counter ticks to 1 (below
-        # DEFAULT_FAILURE_LIMIT=2 — task stays ready).
+        # One real crash is held for an operator. The explicit unblock grants
+        # the retry and resets the unified counter as a fresh human decision.
         _drive_nonzero_crash(conn, tid, 991000)
         task = kb.get_task(conn, tid)
-        assert task.status == "ready"
+        assert task.status == "blocked"
         assert task.consecutive_failures == 1
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).consecutive_failures == 0
 
-        # Two violations after it: streak 1 and 2 — both retry, unified
-        # counter untouched. (Pre-fix: the crash consumed the budget and the
-        # violations blocked well before three of them happened.)
-        for i, pid in enumerate((991001, 991002)):
+        # Two violations after it: both require an explicit operator decision,
+        # while their accounting remains independent of the unified counter.
+        for pid in (991001, 991002):
             _drive_protocol_violation(conn, tid, pid)
             task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"violation {i + 1} after a crash must still retry, "
-                f"got {task.status}"
-            )
-            assert task.consecutive_failures == 1, (
+            assert task.status == "blocked"
+            assert task.consecutive_failures == 0, (
                 "below-budget violations must not tick the unified counter"
             )
+            assert kb.unblock_task(conn, tid)
 
         # Third consecutive violation: streak hits the bound — blocked.
         _drive_protocol_violation(conn, tid, 991003)

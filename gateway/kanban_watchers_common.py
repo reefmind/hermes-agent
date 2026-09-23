@@ -43,7 +43,25 @@ def _list_boards(kb: Any) -> list:
 
 
 def _board_slugs(kb: Any) -> list:
-    return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
+    """Boards in dispatch-visit order.
+
+    Brett, 2026-09-04/06: with a HOST-level max_in_progress and boards visited
+    default-first/alphabetically, the reefmind board (last) starved.
+    ``kanban.board_priority`` orders the visit; unlisted boards follow in their
+    natural order. Re-anchored here after the 2026-09-06 upstream split moved
+    the board loop out of kanban_watchers.py.
+    """
+    slugs = [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
+    try:
+        from hermes_cli.config import load_config_readonly
+        prio = (load_config_readonly() or {}).get("kanban", {}).get("board_priority") or []
+        prio = [str(x).strip() for x in prio if str(x).strip()]
+    except Exception:
+        prio = []
+    if not prio:
+        return slugs
+    rank = {slug: i for i, slug in enumerate(prio)}
+    return sorted(slugs, key=lambda s: (rank.get(s, len(rank)), slugs.index(s)))
 
 
 def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
