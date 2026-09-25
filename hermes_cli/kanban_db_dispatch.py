@@ -2665,6 +2665,42 @@ def _open_pr_cap_exceeded(board: Optional[str]) -> bool:
     return False
 
 
+def _continues_existing_pr(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when spawning this card cannot open a NEW PR (BLOCK-CONTRACT-PR-CAP-SCOPE).
+
+    The open-PR cap exists to stop new PRs; holding the reviewers and
+    continuations of PRs that already exist means those PRs never reach Ready
+    and the count never drains (2026-09-25: 18 > 15 froze board reefmind).
+    Exempt: a canonical review child (named by a parent's review_requirement,
+    enqueued by the delivery controller, or a linked child titled as a review)
+    and any card whose body, result, comments, runs or events already record a
+    GitHub PR URL. Anything else stays held.
+    """
+    try:
+        row = conn.execute("SELECT body, result, title FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
+            "('delivery_review_enqueued','delivery_review_candidate') LIMIT 1", (task_id,)).fetchone():
+            return True
+        for other in conn.execute(
+                "SELECT review_requirement FROM tasks WHERE id!=? AND review_requirement IS NOT NULL", (task_id,)):
+            if _kb._json_dict(other["review_requirement"]).get("review_task_id") == task_id:
+                return True
+        if "review" in str(row["title"] or "").lower() and conn.execute(
+                "SELECT 1 FROM task_links WHERE child_id=? LIMIT 1", (task_id,)).fetchone():
+            return True
+        texts = [row["body"], row["result"]]
+        texts += [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (task_id,))]
+        texts += [t for r in conn.execute(
+            "SELECT summary, metadata FROM task_runs WHERE task_id=?", (task_id,)) for t in r]
+        texts += [r[0] for r in conn.execute("SELECT payload FROM task_events WHERE task_id=?", (task_id,))]
+        return any(t and _RESPAWN_GUARD_PR_URL_RE.search(str(_kb._lossy_text(t))) for t in texts)
+    except Exception:
+        return False
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -2697,10 +2733,19 @@ def _dispatch_once_locked(
     )
     if not may_spawn:
         return result
-    if _open_pr_cap_exceeded(board):  # BLOCK-CONTRACT-PR-CAP-CALL
-        return result
+    # BLOCK-CONTRACT-PR-CAP-CALL: above the cap only cards that would open a
+    # NEW PR are held; reviews and existing-PR continuations drain the queue.
+    pr_cap_held = _open_pr_cap_exceeded(board)
 
     ready_rows = _lane_rows(conn, "ready")
+    if pr_cap_held:
+        kept = []
+        for row in ready_rows:
+            if _continues_existing_pr(conn, row["id"]):
+                kept.append(row)
+            else:
+                result.delivery_holds.append((row["id"], "open-PR cap exceeded: new-PR work held until the queue drains"))
+        ready_rows = kept
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []

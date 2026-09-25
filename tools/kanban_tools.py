@@ -724,6 +724,50 @@ def _one_card_pr_is_open(url: str) -> bool:
 _ONE_CARD_PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 
 
+_CHECK_FAILURE_RE = re.compile(r"fail|error", re.I)
+
+
+def _normalize_delivery_checks(metadata):
+    """Normalize implementation-handoff check results before the run closes.
+
+    The delivery controller accepts only ``result == "passed"`` and otherwise
+    parks the closed run with 'focused check evidence required', which nothing
+    wakes (2026-09-25: t_10b3bdb0, t_5bc3c5ca wrote "passed (127/127)"). A
+    result starting with "passed" and naming no failure becomes exactly
+    "passed", original text kept in ``note``. Anything else returns an error
+    string so the worker fixes it in-turn. Reviewer verdicts are left alone.
+    """
+    review = metadata.get("delivery_review") if isinstance(metadata, dict) else None
+    if not isinstance(review, dict) or "verdict" in review:
+        return metadata, None
+    evidence = review.get("evidence")
+    checks = evidence.get("checks") if isinstance(evidence, dict) else None
+    if not isinstance(checks, list):
+        return metadata, None
+    fixed = []
+    for i, check in enumerate(checks):
+        if not isinstance(check, dict) or not str(check.get("command") or "").strip():
+            return metadata, (f"delivery_review.evidence.checks[{i}] needs a non-empty 'command'.")
+        result = check.get("result")
+        text = result.strip() if isinstance(result, str) else ""
+        if text == "passed":
+            fixed.append(check)
+        elif text.lower().startswith("passed") and not _CHECK_FAILURE_RE.search(text):
+            note = f"{check['note']}; {text}" if check.get("note") else text
+            fixed.append({**check, "result": "passed", "note": note})
+        elif _CHECK_FAILURE_RE.search(text):
+            return metadata, (
+                f"delivery_review.evidence.checks[{i}] ({check['command']!r}) reports {result!r}. "
+                f"A failing check cannot be handed to review: fix it and rerun, or, if it is a "
+                f"pre-existing failure you did not cause, drop it from checks and list it under "
+                f"'Known test failures' in the PR body. Detail such as '0 failed' belongs in 'note'.")
+        else:
+            return metadata, (
+                f"delivery_review.evidence.checks[{i}] ({check['command']!r}) result must be exactly "
+                f"\"passed\" (got {result!r}); put counts or detail in a 'note' field.")
+    return {**metadata, "delivery_review": {**review, "evidence": {**evidence, "checks": fixed}}}, None
+
+
 @_kanban_handler("kanban_complete")
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -741,6 +785,11 @@ def _handle_complete(args: dict, **kw) -> str:
         metadata = _merge_artifacts(metadata, artifacts)
     _check(summary or result, "provide at least one of: summary (preferred), result")
     _require_dict_metadata(metadata)
+    metadata, check_error = _normalize_delivery_checks(metadata)
+    if check_error:
+        return tool_error(
+            f"kanban_complete blocked: {check_error} Your task is still in-flight (no state "
+            f"change). Retry kanban_complete with corrected delivery_review evidence.")
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary

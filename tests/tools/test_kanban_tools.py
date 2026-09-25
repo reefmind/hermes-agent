@@ -1348,3 +1348,46 @@ def test_create_wires_explicit_review_requirement(worker_env):
             "required": True,
             "owner": "techlead",
         }
+
+
+def _delivery_meta(*results):
+    return {"delivery_review": {"head": "a" * 40, "evidence": {
+        "artifact": "https://github.com/o/r/pull/1",
+        "checks": [{"command": f"pytest -k c{i}", "result": r} for i, r in enumerate(results)]}}}
+
+
+def test_complete_normalizes_passed_with_detail_to_exact_passed(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    out = json.loads(kt._handle_complete({
+        "summary": "handoff", "metadata": _delivery_meta("passed", "Passed (127/127)")}))
+    assert out["ok"] is True
+    conn = kbc.connect()
+    try:
+        checks = kb.latest_run(conn, worker_env).metadata["delivery_review"]["evidence"]["checks"]
+    finally:
+        conn.close()
+    assert checks == [{"command": "pytest -k c0", "result": "passed"},
+                      {"command": "pytest -k c1", "result": "passed", "note": "Passed (127/127)"}]
+
+
+@pytest.mark.parametrize("result", ["failed (3/127)", "passed (2 failed)", "error", "green", None])
+def test_complete_rejects_non_passing_check_before_run_closes(worker_env, result):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    out = json.loads(kt._handle_complete({"summary": "handoff", "metadata": _delivery_meta(result)}))
+    assert "still in-flight" in out["error"]
+    conn = kbc.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_leaves_reviewer_verdict_checks_alone(worker_env):
+    from tools import kanban_tools as kt
+    meta = {"delivery_review": {"head": "a" * 40, "verdict": "BLOCK", "findings": "x",
+                                "evidence": {"checks": [{"command": "pytest", "result": "failed"}]}}}
+    assert kt._normalize_delivery_checks(meta) == (meta, None)

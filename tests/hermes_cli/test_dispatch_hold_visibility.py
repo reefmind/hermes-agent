@@ -340,3 +340,34 @@ def test_no_hold_diagnostic_once_the_task_is_running(conn):
 
     diags = _diag_kinds(kb.get_task(conn, tid), kb.list_events(conn, tid))
     assert "respawn_guard_hold" not in diags
+
+
+# ---------------------------------------------------------------------------
+# Open-PR cap holds only work that would open a NEW PR
+# ---------------------------------------------------------------------------
+
+def _ready(conn, title, **kw):
+    tid = kb.create_task(conn, title=title, assignee="integrator", **kw)
+    with kanban_db_connect.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    return tid
+
+
+def test_open_pr_cap_holds_new_pr_work_but_not_reviews_or_continuations(conn, monkeypatch):
+    monkeypatch.setattr(kanban_db_dispatch, "_open_pr_cap_exceeded", lambda board: True)
+    monkeypatch.setattr(kanban_db_dispatch, "check_respawn_guard", lambda *a, **k: None)
+    new_work = _ready(conn, "implement brand new feature")
+    continuation = _ready(conn, "continue delivery", body=f"Fix CI on {PR_URL}")
+    parent = kb.create_task(conn, title="implement parent", assignee="backend")
+    reviewer = _ready(conn, "Independent review: parent", parents=[parent])
+    with kanban_db_connect.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (reviewer,))
+    spawned = []
+
+    def spawn(task, ws, board=None):
+        spawned.append(task.id)
+        return None
+
+    res = kanban_db_dispatch._dispatch_once_locked(conn, spawn_fn=spawn, board="reefmind")
+    assert (set(spawned), [h[0] for h in res.delivery_holds]) == ({continuation, reviewer}, [new_work])
