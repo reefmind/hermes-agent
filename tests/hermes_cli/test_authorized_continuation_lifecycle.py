@@ -335,3 +335,34 @@ def test_dispatch_does_not_synthesize_delivery_completion(conn, pending):
         assert not result.spawned
         assert kb.get_task(conn, tid).status == "ready"
     assert not any(e.kind == "completed" for e in kb.list_events(conn, tid))
+
+
+def test_reopen_review_reason_naming_the_pr_authorizes_one_continuation(conn, monkeypatch):
+    # Live t_dc0929e3 (2026-09-24): `reopen-review --reason "...PR URL..."` wrote
+    # review_reopened and then its own reason comment in the same second, so the
+    # reason became the newest PR comment AFTER the requeue and re-armed active_pr.
+    monkeypatch.setattr(kb.time, "time", lambda: 1800000000)
+    tid = card(conn)
+    assert kb.request_review(conn, tid, summary="ready")
+    out = cli.run_slash(f'reopen-review {tid} --reason "Fold review findings into {PR}"')
+    assert "Reopened" in out
+    assert kanban_db_dispatch.check_respawn_guard(conn, tid) is None
+    assert kb.claim_task(conn, tid, claimer="remote-host:123")
+    assert kanban_db_dispatch.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_unrelated_pr_comment_in_the_reopen_second_still_holds(conn, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 1800000000)
+    tid = kb.create_task(conn, title="Ordering", assignee="integrator")
+    assert kb.request_review(conn, tid, summary="ready")
+    assert kb.reopen_review_task(conn, tid)
+    kb.add_comment(conn, tid, "integrator", f"Draft PR {PR}")
+    assert kanban_db_dispatch.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_unblock_reason_naming_the_pr_authorizes_one_continuation(conn, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 1800000000)
+    tid = card(conn)
+    assert kb.block_task(conn, tid, reason="operator pause")
+    assert "Unblocked" in cli.run_slash(f'unblock {tid} --reason "Continue {PR}"')
+    assert kanban_db_dispatch.check_respawn_guard(conn, tid) is None

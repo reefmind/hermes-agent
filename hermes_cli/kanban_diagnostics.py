@@ -740,6 +740,11 @@ def _rule_respawn_guard_hold(task, events, runs, now, cfg) -> list[Diagnostic]:
             "wall. Retrying will not help until the credential is fixed — check "
             "`hermes -p <profile> auth`."
         ),
+        "open_pr_cap": (
+            "At the last observed hold, the board's repo had more recent open "
+            "agent PRs than HERMES_KANBAN_OPEN_PR_CAP, so the dispatcher spawns "
+            "nothing on this board until PRs are merged, closed or drafted."
+        ),
         "rate_limit_cooldown": (
             "The last worker bailed on a provider rate limit. The card will "
             "respawn on its own once the cooldown elapses; no action needed."

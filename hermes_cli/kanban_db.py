@@ -1941,6 +1941,57 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
         return int(cur.lastrowid or 0)
 
 
+# Worker-filed remediation cards (2026-09-25: t_6967a7d8 and t_7eeafcc5, two
+# remediator cards for one main-red test 4 min apart, different titles). A
+# failure is identified by the test file AND the kebab test id it names; either
+# alone is too broad (area files hold hundreds of tests, prose has "end-to-end").
+_REMEDIATION_TITLE_RE = re.compile(
+    r"\b(?:main|ci)\b.{0,40}\b(?:red|failing|broken)\b|\b(?:red|failing|broken)\b.{0,40}\b(?:main|ci)\b"
+    r"|\bremediat", re.IGNORECASE)
+_FAILURE_FILE_RE = re.compile(r"[\w./-]*\btests?/[\w./-]+\.(?:[cm]?js|ts|py)\b")
+_FAILURE_ID_RE = re.compile(r"(?<![\w./-])[a-z0-9]+(?:-[a-z0-9]+){2,}(?![\w/])")
+_REMEDIATION_OPEN = ("triage", "todo", "ready", "running", "blocked", "review", "scheduled")
+_REMEDIATION_WINDOW_SECONDS = 14 * 86400
+
+
+def _is_remediation_card(title: str, assignee: Optional[str]) -> bool:
+    return (assignee or "").strip().lower() == "remediator" or bool(_REMEDIATION_TITLE_RE.search(title or ""))
+
+
+def _failure_fingerprint(title: str, body: Optional[str]) -> tuple[frozenset, frozenset]:
+    text = f"{title or ''}\n{body or ''}"
+    files = frozenset(m.lower().lstrip("./") for m in _FAILURE_FILE_RE.findall(text))
+    ids = frozenset(t for t in _FAILURE_ID_RE.findall(text.lower()) if re.search(r"[a-z]", t))
+    return files, ids
+
+
+def find_open_remediation_duplicate(
+    conn: sqlite3.Connection, *, title: str, body: Optional[str], assignee: Optional[str],
+) -> Optional[str]:
+    """Id of an open remediation card for the same failure, or ``None``.
+
+    Same assignee, still open, created in the last 14 days, and either the same
+    normalized title or a shared failing test file plus a shared test id."""
+    if not _is_remediation_card(title, assignee):
+        return None
+    norm = " ".join((title or "").lower().split())
+    files, ids = _failure_fingerprint(title, body)
+    placeholders = ",".join("?" for _ in _REMEDIATION_OPEN)
+    for row in conn.execute(
+        f"SELECT id, title, body FROM tasks WHERE assignee = ? AND status IN ({placeholders}) "
+        "AND created_at >= ? ORDER BY created_at ASC",
+        (assignee, *_REMEDIATION_OPEN, int(time.time()) - _REMEDIATION_WINDOW_SECONDS),
+    ):
+        if not _is_remediation_card(row["title"], assignee):
+            continue
+        if " ".join((row["title"] or "").lower().split()) == norm:
+            return row["id"]
+        other_files, other_ids = _failure_fingerprint(row["title"], row["body"])
+        if files & other_files and ids & other_ids:
+            return row["id"]
+    return None
+
+
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
     if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
         raise ValueError(f"unknown task {task_id}")
@@ -4186,13 +4237,19 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
-def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
-
-
+def reopen_review_task(
+    conn: sqlite3.Connection, task_id: str, *,
+    reason_comment: Optional[tuple[str, str]] = None,
+) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
-    not a block; only :func:`complete_task` clears them)."""
+    not a block; only :func:`complete_task` clears them).
+
+    ``reason_comment`` is ``(author, body)``, written in the same transaction
+    BEFORE the ``review_reopened`` event: the respawn guard orders requeues
+    after PR comments by event id, so a reason that names the PR must not
+    land after the authorization it carries (t_dc0929e3 sat 11.6h in ready)."""
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -4218,6 +4275,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer
+        if reason_comment is not None:
+            payload["reason_comment_id"] = add_comment(conn, task_id, *reason_comment)
         _append_event(
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
         )

@@ -1323,6 +1323,20 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        # A worker filing remediation for a failure that already has an open
+        # card gets that card back instead of a duplicate (explicit keys win).
+        dup = None if (self_tid is None or args.get("idempotency_key")) else (
+            kb.find_open_remediation_duplicate(
+                conn, title=str(title), body=args.get("body"), assignee=str(assignee)))
+        if dup:
+            kb.add_comment(conn, dup, _persisted_identity(),
+                           f"Duplicate remediation report from {self_tid} folded into this card: "
+                           f"{str(title).strip()}\n\n{str(args.get('body') or '').strip()}".strip())
+            return _ok(task_id=dup, deduplicated=True,
+                       note=("an open remediation card for this failure already exists; your report "
+                             "was added to it as a comment. It was not created by you: do not list "
+                             "it in created_cards."),
+                       **_fields(kb.get_task(conn, dup), _CREATED_FIELDS))
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),

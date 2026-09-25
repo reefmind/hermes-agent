@@ -1105,12 +1105,10 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
+        comment = (author or "operator", f"CHANGES REQUESTED: {reason}") if reason else None
+
         def op(tid):
-            if not kb.reopen_review_task(conn, tid):
-                return False
-            if reason:
-                kb.add_comment(conn, tid, author or "operator", f"CHANGES REQUESTED: {reason}")
-            return True
+            return kb.reopen_review_task(conn, tid, reason_comment=comment)
 
         return _bulk_apply(ids, op, lambda tid: f"Reopened {tid}{suffix}",
                            lambda tid: f"cannot reopen {tid} (not in review?)")

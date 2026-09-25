@@ -117,12 +117,18 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_locked": bool(getattr(res, "skipped_locked", False)),
             "memory_pressure": getattr(res, "memory_pressure", None),
             "capacity_hold": getattr(res, "capacity_hold", None),
+            "held_ready": list(getattr(res, "held_ready", None) or []),
             "delivery_holds": list(getattr(res, "delivery_holds", [])),
         }, ascii=True)
         return 0
     if getattr(res, "capacity_hold", None):
         hold = res.capacity_hold
-        print(f"Capacity hold ({hold['scope']}): {hold['running']} running / {hold['limit']} limit; resumes when a slot frees. --max is total concurrency, not extra spawns.")
+        if hold["scope"] == "open_pr_cap":
+            print(f"Open-PR cap hold: {hold['running']} recent open agent PRs on {hold.get('repo')} > cap {hold['limit']}; no new spawns until the queue drains.")
+        else:
+            print(f"Capacity hold ({hold['scope']}): {hold['running']} running / {hold['limit']} limit; resumes when a slot frees. --max is total concurrency, not extra spawns.")
+    if getattr(res, "held_ready", None):
+        print(f"  held: {', '.join(res.held_ready)}")
     for tid, why in getattr(res, "delivery_holds", []):
         print(f"Delivery hold: {tid}: {why}")
     print(f"Reclaimed:    {res.reclaimed}")
@@ -260,8 +266,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
             if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
+                held = kbd.describe_holds([(None, res)])
+                held = f" Held: {held}." if held else ""
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
                     f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "

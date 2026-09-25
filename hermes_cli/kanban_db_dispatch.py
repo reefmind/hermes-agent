@@ -155,6 +155,10 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    held_ready: list[str] = field(default_factory=list)
+    """Assigned ready task ids a board-wide hold (``capacity_hold``, critical
+    memory pressure) kept from the ready lane this tick, so the stuck warning
+    can name the cards instead of reporting a bare zero-spawn count."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -184,6 +188,49 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def _board_hold_label(res: "DispatchResult") -> Optional[str]:
+    hold = res.capacity_hold
+    if hold:
+        scope, running, limit = hold.get("scope"), hold.get("running"), hold.get("limit")
+        if scope == "open_pr_cap":
+            return f"open_pr_cap({running}>{limit})"
+        return f"{scope}_cap({running}/{limit})"
+    if res.memory_pressure == "critical":
+        return "memory_pressure=critical"
+    return None
+
+
+def describe_holds(
+    results: Iterable[tuple[Optional[str], Optional["DispatchResult"]]], *, limit: int = 12,
+) -> str:
+    """Per-card hold reasons for the "dispatcher stuck" warnings, or ``""``.
+
+    ``reefmind: t_1=open_pr_cap(17>15), t_2=active_pr`` — a board-wide hold is
+    attributed to every ready card it held, so the operator sees which card is
+    waiting on what instead of a generic "check profile health" hint.
+    """
+    boards: list[str] = []
+    for slug, res in results:
+        if res is None:
+            continue
+        items: list[str] = []
+        label = _board_hold_label(res)
+        if label:
+            items += [f"{tid}={label}" for tid in res.held_ready] or [label]
+        if res.skipped_locked:
+            items.append("dispatch_lock_held")
+        items += [f"{tid}={why}" for tid, why in res.respawn_guarded]
+        items += [f"{tid}=delivery_hold" for tid, _why in res.delivery_holds if tid not in res.held_ready]
+        items += [f"{tid}=per_profile_cap({who})" for tid, who, _n in res.skipped_per_profile_capped]
+        items += [f"{tid}=unassigned" for tid in res.skipped_unassigned]
+        if not items:
+            continue
+        extra = len(items) - limit
+        shown = ", ".join(items[:limit]) + (f", +{extra} more" if extra > 0 else "")
+        boards.append(f"{slug or _kb.DEFAULT_BOARD}: {shown}")
+    return "; ".join(boards)
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2635,16 +2682,30 @@ _PR_CAP_CACHE: dict = {}
 
 
 def _open_pr_cap_exceeded(board: Optional[str]) -> bool:
+    return _open_pr_cap_hold(board) is not None
+
+
+def _open_pr_cap_hold(board: Optional[str]) -> Optional[dict]:
+    """``capacity_hold`` dict when the board's repo is over the open-PR cap.
+
+    ``board=None`` (``hermes kanban dispatch`` without ``--board``) means the
+    current board: skipping the cap there made a dry-run promise spawns the
+    gateway tick was holding (2026-09-25, t_296d572d held 9.5h)."""
     import shutil as _shutil, subprocess as _sp, datetime as _dt
+    if not board:
+        try:
+            board = _kb.get_current_board()
+        except Exception:
+            board = None
     repo = _PR_CAP_REPOS.get(str(board or "").lower())
     if not repo:
-        return False
+        return None
     try:
         cap = int(os.environ.get("HERMES_KANBAN_OPEN_PR_CAP", "10"))
     except ValueError:
         cap = 10
     if cap <= 0:
-        return False
+        return None
     now = time.time()
     hit = _PR_CAP_CACHE.get(repo)
     if hit and now - hit[0] < 120:
@@ -2657,12 +2718,23 @@ def _open_pr_cap_exceeded(board: Optional[str]) -> bool:
             cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=14)).isoformat()
             count = sum(1 for p in json.loads(out or "[]") if not p.get("isDraft") and p.get("createdAt", "") >= cutoff)
         except Exception:
-            return False
+            return None
         _PR_CAP_CACHE[repo] = (now, count)
     if count > cap:
         __import__("logging").getLogger(__name__).info("kanban dispatcher [%s]: %d recent open agent PRs > cap %d — holding new spawns until the queue drains", board, count, cap)
-        return True
-    return False
+        return {"scope": "open_pr_cap", "running": count, "limit": cap, "repo": repo}
+    return None
+
+
+def _hold_ready_lane(conn: sqlite3.Connection, result: DispatchResult, *, stamp: Optional[str], dry_run: bool) -> None:
+    """Name the assigned ready cards a board-wide hold kept back this tick.
+
+    ``stamp`` also records a deduped ``respawn_guarded`` event per card, so a
+    long policy hold shows in ``tail``/diagnostics on the card itself."""
+    result.held_ready = [row["id"] for row in _lane_rows(conn, "ready") if row["assignee"]]
+    if stamp and not dry_run:
+        for tid in result.held_ready:
+            _stamp_respawn_guard_event(conn, tid, stamp)
 
 
 def _continues_existing_pr(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -2732,20 +2804,29 @@ def _dispatch_once_locked(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
     if not may_spawn:
+        _hold_ready_lane(conn, result, stamp=None, dry_run=dry_run)
         return result
     # BLOCK-CONTRACT-PR-CAP-CALL: above the cap only cards that would open a
     # NEW PR are held; reviews and existing-PR continuations drain the queue.
-    pr_cap_held = _open_pr_cap_exceeded(board)
+    # Held cards are named (capacity_hold + held_ready + a deduped card event)
+    # so the stuck warning says which card waits on the cap.
+    pr_cap_hold = _open_pr_cap_hold(board)
 
     ready_rows = _lane_rows(conn, "ready")
-    if pr_cap_held:
+    if pr_cap_hold:
+        result.capacity_hold = pr_cap_hold
         kept = []
         for row in ready_rows:
             if _continues_existing_pr(conn, row["id"]):
                 kept.append(row)
             else:
                 result.delivery_holds.append((row["id"], "open-PR cap exceeded: new-PR work held until the queue drains"))
+                if row["assignee"]:
+                    result.held_ready.append(row["id"])
         ready_rows = kept
+        if not dry_run:
+            for tid in result.held_ready:
+                _stamp_respawn_guard_event(conn, tid, "open_pr_cap")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []

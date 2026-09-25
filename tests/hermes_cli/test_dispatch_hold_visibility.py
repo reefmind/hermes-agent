@@ -343,6 +343,49 @@ def test_no_hold_diagnostic_once_the_task_is_running(conn):
 
 
 # ---------------------------------------------------------------------------
+# 4. The open-PR cap is a board-wide hold and must be named, per card
+# ---------------------------------------------------------------------------
+# Live 2026-09-24 22:30 -> 09-25 10:09: reefmind had 16-17 recent agent PRs over
+# HERMES_KANBAN_OPEN_PR_CAP=15, so every tick returned before the ready lane.
+# The warning said only "0 workers spawned" and `dispatch --dry-run` (no board
+# argument) skipped the cap and claimed it would spawn.
+
+def _pin_open_prs(monkeypatch, count, cap=15):
+    monkeypatch.setenv("HERMES_KANBAN_OPEN_PR_CAP", str(cap))
+    repo = kanban_db_dispatch._PR_CAP_REPOS["reefmind"]
+    monkeypatch.setitem(kanban_db_dispatch._PR_CAP_CACHE, repo, (time.time(), count))
+
+
+def test_open_pr_cap_hold_is_recorded_and_stamped_on_each_held_card(conn, monkeypatch):
+    _pin_open_prs(monkeypatch, 17)
+    tid = kb.create_task(conn, title="Held by the PR cap", assignee="backend")
+    spawned = []
+    res = kanban_db_dispatch.dispatch_once(
+        conn, board="reefmind", spawn_fn=lambda task, ws: spawned.append(task.id))
+    assert (spawned, res.capacity_hold["scope"], res.held_ready) == ([], "open_pr_cap", [tid])
+    stamped = [e.payload for e in kb.list_events(conn, tid) if e.kind == "respawn_guarded"]
+    assert stamped == [{"reason": "open_pr_cap"}]
+
+
+def test_stuck_warning_names_the_hold_reason_per_card(conn, monkeypatch):
+    _pin_open_prs(monkeypatch, 17)
+    held = kb.create_task(conn, title="Held by the PR cap", assignee="backend")
+    res = kanban_db_dispatch.dispatch_once(
+        conn, board="reefmind", spawn_fn=lambda task, ws: None)
+    text = kanban_db_dispatch.describe_holds([("reefmind", res)])
+    assert f"{held}=open_pr_cap(17>15)" in text
+
+
+def test_dispatch_without_a_board_argument_applies_the_current_boards_cap(conn, monkeypatch, capsys):
+    _pin_open_prs(monkeypatch, 17)
+    monkeypatch.setattr(kb, "get_current_board", lambda: "reefmind")
+    kb.create_task(conn, title="Held by the PR cap", assignee="backend")
+    assert kcli._cmd_dispatch(_dispatch_args(dry_run=True, json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert (payload["spawned"], payload["capacity_hold"]["scope"]) == ([], "open_pr_cap")
+
+
+# ---------------------------------------------------------------------------
 # Open-PR cap holds only work that would open a NEW PR
 # ---------------------------------------------------------------------------
 
@@ -354,7 +397,8 @@ def _ready(conn, title, **kw):
 
 
 def test_open_pr_cap_holds_new_pr_work_but_not_reviews_or_continuations(conn, monkeypatch):
-    monkeypatch.setattr(kanban_db_dispatch, "_open_pr_cap_exceeded", lambda board: True)
+    monkeypatch.setattr(kanban_db_dispatch, "_open_pr_cap_hold",
+                        lambda board: {"scope": "open_pr_cap", "running": 18, "limit": 15})
     monkeypatch.setattr(kanban_db_dispatch, "check_respawn_guard", lambda *a, **k: None)
     new_work = _ready(conn, "implement brand new feature")
     continuation = _ready(conn, "continue delivery", body=f"Fix CI on {PR_URL}")

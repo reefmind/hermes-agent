@@ -1391,3 +1391,54 @@ def test_complete_leaves_reviewer_verdict_checks_alone(worker_env):
     meta = {"delivery_review": {"head": "a" * 40, "verdict": "BLOCK", "findings": "x",
                                 "evidence": {"checks": [{"command": "pytest", "result": "failed"}]}}}
     assert kt._normalize_delivery_checks(meta) == (meta, None)
+
+
+# Live 2026-09-25: two workers filed remediator cards 4 min apart for the same
+# main-red failure (t_6967a7d8, t_7eeafcc5) under different titles.
+_MAIN_RED_A = (
+    "Main red: trust-transparency blog test pins sitemap /blog/ lastmod to 2026-08-23",
+    "main CI (Core syntax and unit checks) has been red since f91d4b2a5.\n\nFailing: "
+    "cloud/tests/test-misc-unit.js, test 'trust-transparency-blog-static', assertion "
+    "'blog sitemap freshness advances with the newer weekly update'.",
+)
+_MAIN_RED_B = (
+    "Fix red main: trust-transparency-blog-static hardcodes blog sitemap lastmod 2026-08-23",
+    "main's 'Core syntax and unit checks' has been failing since the blog content commits.\n\n"
+    "Failing check: cloud/tests/test-misc-unit.js, trust-transparency-blog-static (~line 4859).",
+)
+
+
+def test_worker_remediation_card_for_an_open_failure_is_deduplicated(worker_env):
+    from tools import kanban_tools as kt
+    first = json.loads(kt._handle_create(
+        {"title": _MAIN_RED_A[0], "body": _MAIN_RED_A[1], "assignee": "remediator"}))
+    second = json.loads(kt._handle_create(
+        {"title": _MAIN_RED_B[0], "body": _MAIN_RED_B[1], "assignee": "remediator"}))
+    assert (second["task_id"], second["deduplicated"]) == (first["task_id"], True)
+
+
+def test_worker_remediation_card_for_a_different_failure_is_created(worker_env):
+    from tools import kanban_tools as kt
+    first = json.loads(kt._handle_create(
+        {"title": _MAIN_RED_A[0], "body": _MAIN_RED_A[1], "assignee": "remediator"}))
+    other = json.loads(kt._handle_create({
+        "title": "Main red: dosing-schedule-rounding fails",
+        "body": "Failing: cloud/tests/test-misc-unit.js, test 'dosing-schedule-rounding'.",
+        "assignee": "remediator"}))
+    assert other["task_id"] != first["task_id"] and not other.get("deduplicated")
+
+
+def test_remediation_card_is_not_deduplicated_against_a_finished_card(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    first = json.loads(kt._handle_create(
+        {"title": _MAIN_RED_A[0], "body": _MAIN_RED_A[1], "assignee": "remediator"}))
+    conn = kbc.connect()
+    try:
+        kb.archive_task(conn, first["task_id"])
+    finally:
+        conn.close()
+    again = json.loads(kt._handle_create(
+        {"title": _MAIN_RED_B[0], "body": _MAIN_RED_B[1], "assignee": "remediator"}))
+    assert again["task_id"] != first["task_id"]
