@@ -189,6 +189,30 @@ def _authorized_reclaimed_review(conn, parent, child, run):
                 and promotion.get("actor") and promotion["actor"] != child["assignee"])
 
 
+def _create_review_child(conn, parent, requirement, head, rid):
+    """Create and bind the one review child a required handoff never named.
+
+    Only reached with zero linked children, so a rerun (child now linked and
+    bound) creates nothing; the idempotency key also dedupes on (task, head).
+    More than one child stays ambiguous and keeps the visible hold.
+    """
+    tid, owner = parent["id"], requirement["owner"]
+    child_id = kb.create_task(
+        conn, title=f"Independent review: {parent['title']}"[:200],
+        body=(f"Independent exact-head review of {tid} at {head}. Return delivery_review "
+              "metadata with head, verdict PASS/BLOCK, and findings."),
+        assignee=owner, created_by="delivery-review", parents=[tid], tenant=parent["tenant"],
+        workspace_kind=parent["workspace_kind"], workspace_path=parent["workspace_path"],
+        idempotency_key=f"delivery-review:{tid}:{head}")
+    bound = {**requirement, "review_task_id": child_id}
+    conn.execute("UPDATE tasks SET review_requirement=? WHERE id=?",
+                 (json.dumps(bound, sort_keys=True), tid))
+    _emit_once(conn, tid, "delivery_review_sent", f"{tid}:{child_id}:{head}",
+               {"head": head, "review_task": child_id, "implementation_task": tid,
+                "owner": owner, "created": True}, rid)
+    return child_id
+
+
 def reconcile(conn):
     """One atomic controller pass. Return externally-managed review parents.
 
@@ -236,6 +260,11 @@ def reconcile(conn):
                 "SELECT t.* FROM tasks t JOIN task_links l ON l.child_id=t.id WHERE l.parent_id=?",
                 (tid,),
             ).fetchall()
+            if child_id is None and not children and requirement["owner"] != parent["assignee"]:
+                child_id = _create_review_child(conn, parent, requirement, head, rid)
+                key = f"{tid}:{child_id}:{head}"
+                payload["review_task"] = child_id
+                children = conn.execute("SELECT * FROM tasks WHERE id=?", (child_id,)).fetchall()
             if (len(children) != 1 or children[0]["id"] != child_id
                     or not children[0]["assignee"] or children[0]["assignee"] == parent["assignee"]
                     or children[0]["tenant"] != parent["tenant"]):

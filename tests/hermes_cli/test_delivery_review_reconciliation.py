@@ -739,3 +739,53 @@ def test_authorized_astra_uses_native_spawn_not_inherited_claude(conn, tmp_path,
     assert cmd[cmd.index("-m") + 1] == "gpt-6-astra"
     assert cmd[cmd.index("--provider") + 1] == "openai-codex"
     assert "ultra" in cmd
+
+
+def unnamed_handoff(conn, parent, head):
+    data = candidate(None, head)
+    data["review_requirement"] = {"required": True, "owner": "pr-reviewer"}
+    run = kb.claim_task(conn, parent, claimer="remote:test")
+    assert kb.complete_task(conn, parent, metadata=data, expected_run_id=run.current_run_id)
+    assert kb.get_task(conn, parent).status == "review"
+
+
+def children_of(conn, parent):
+    return [r["child_id"] for r in conn.execute("SELECT child_id FROM task_links WHERE parent_id=?", (parent,))]
+
+
+def test_unnamed_handoff_creates_exactly_one_bound_review_child(conn):
+    parent = kb.create_task(conn, title="Implementation", assignee="integrator")
+    unnamed_handoff(conn, parent, A)
+    tick(conn, max_spawn=0)
+    [child] = children_of(conn, parent)
+    assert kb.get_task(conn, child).assignee == "pr-reviewer"
+    assert kb.get_task(conn, parent).review_requirement["review_task_id"] == child
+    assert kb.get_task(conn, child).status == "ready"
+    sent = [e for e in kb.list_events(conn, parent) if e.kind == "delivery_review_sent"]
+    assert [e.payload["review_task"] for e in sent] == [child]
+    for _ in range(2):
+        tick(conn, max_spawn=0)
+    assert children_of(conn, parent) == [child]
+    assert len([e for e in kb.list_events(conn, parent) if e.kind == "delivery_review_sent"]) == 1
+
+
+def test_auto_created_review_block_reopens_done_parent(conn):
+    parent = kb.create_task(conn, title="Implementation", assignee="integrator")
+    unnamed_handoff(conn, parent, A)
+    tick(conn)
+    [child] = children_of(conn, parent)
+    assert kb.get_task(conn, parent).status == "done"
+    verdict(conn, child, A, "BLOCK")
+    tick(conn, max_spawn=0)
+    assert kb.get_task(conn, parent).status == "ready"
+
+
+def test_unnamed_handoff_with_two_children_keeps_hold(conn):
+    parent = kb.create_task(conn, title="Implementation", assignee="integrator")
+    for name in ("pr-reviewer", "qa"):
+        kb.create_task(conn, title=f"child {name}", assignee=name, parents=[parent])
+    unnamed_handoff(conn, parent, A)
+    result = tick(conn, max_spawn=0)
+    assert result.delivery_holds
+    assert len(children_of(conn, parent)) == 2
+    assert not any(e.kind == "delivery_review_sent" for e in kb.list_events(conn, parent))
