@@ -19,6 +19,9 @@ from typing import Any, Callable, Optional
 from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
+from gateway.kanban_watchers_notifier_owners import (
+    THREAD_UNKNOWN_SQL, hold_next_action, live_owner, thread_unknown_notice, unretired,
+)
 from gateway.wake import session_owned_by_profile
 
 
@@ -341,8 +344,13 @@ class _Collector:
                 continue
             if thread:
                 to_triage += 1
-            else:
-                to_channel += 1
+                continue
+            to_channel += 1
+            # Keep the #kanban fallback, but ask once where the card belongs.
+            try:
+                conn.execute(THREAD_UNKNOWN_SQL, (row["id"], row["id"], slug, chat, row["id"]))
+            except Exception as exc:
+                logger.debug("kanban notifier: could not queue thread ask for %s: %s", row["id"], exc)
         if to_triage or to_channel:
             conn.commit()
             logger.info("kanban notifier: board %s — subscribed %d unheard card(s): "
@@ -577,7 +585,7 @@ def _fmt_review_requested(ev, n) -> tuple:
 def _fmt_changes_requested(ev, n) -> tuple:
     payload = ev.payload or {}
     reason = _safe_review_reason(payload.get("reason"))
-    reviewer = _safe_review_reason(payload.get("reviewer"), 48)
+    reviewer = unretired(_safe_review_reason(payload.get("reviewer"), 48))
     implementer = _safe_review_reason(payload.get("implementer"), 48)
     reason_text = reason or t("gateway.kanban.ping.changes_default_reason")
     provenance = t("gateway.kanban.ping.reviewer_suffix", reviewer=reviewer) if reviewer else ""
@@ -654,11 +662,11 @@ def _notice_completed(ev, n):
     review_handoff = (ev.payload or {}).get('review_handoff')
     if completion_kind == 'delivery_review_result':
         implementation_task = _safe_review_reason(review_handoff.get('implementation_task_id'), 48) if isinstance(review_handoff, dict) else ''
-        review_owner = _safe_review_reason(review_handoff.get('owner'), 48) if isinstance(review_handoff, dict) else ''
+        review_owner = live_owner(_safe_review_reason(review_handoff.get('owner'), 48)) if isinstance(review_handoff, dict) else ''
         msg = _stop_notice(icon='🧾', board_tag=board_tag, who_tag=tag, task_id=sub['task_id'], headline='REVIEW RESULT RECORDED', title=title, reason=_safe_review_reason(payload_summary or 'independent review run completed', _NOTICE_REASON_LIMIT), ready='no (the review result is intermediate; the delivery controller has not accepted it)', next_action=f"@{review_owner or 'review owner'} — evaluate this result through the canonical delivery controller" + (f' for implementation task {implementation_task}.' if implementation_task else '.'))
     elif completion_kind == 'implementation_ready_for_review' and isinstance(review_handoff, dict):
         review_task_id = _safe_review_reason(review_handoff.get('review_task_id'), 48)
-        review_owner = _safe_review_reason(review_handoff.get('owner'), 48)
+        review_owner = live_owner(_safe_review_reason(review_handoff.get('owner'), 48))
         msg = _stop_notice(icon='👀', board_tag=board_tag, who_tag='', task_id=sub['task_id'], headline='REVIEW HANDOFF', title=title, reason=_safe_review_reason(payload_summary or 'implementation ready', _NOTICE_REASON_LIMIT), ready='no (implementation ready for independent review; acceptance is pending)', next_action=f"@{review_owner or 'review owner'} — ensure {review_task_id or 'the canonical review task'} is independently reviewed. This implementation handoff is not final acceptance.")
     else:
         msg = f"✔ {board_tag}{tag}Kanban {sub['task_id']} done — {title}{handoff}"
@@ -687,7 +695,7 @@ def _notice_delivery_phase_completed(ev, n):
             review_requirement = {}
     if not isinstance(review_requirement, dict):
         review_requirement = {}
-    contract_owner = _safe_review_reason(review_requirement.get('owner'), 48)
+    contract_owner = live_owner(_safe_review_reason(review_requirement.get('owner'), 48))
     if kind == 'delivery_phase_completed':
         evidence = payload.get('evidence')
         evidence = evidence if isinstance(evidence, dict) else {}
@@ -705,7 +713,7 @@ def _notice_delivery_phase_completed(ev, n):
         msg = _stop_notice(icon='✅', board_tag=board_tag, who_tag='', task_id=implementation_task, headline='DELIVERY ACCEPTED', title=title, reason=f'canonical independent review accepted {pair}' if accepted else f'acceptance metadata is incomplete for {pair}', ready='yes (canonical acceptance is ready)' if accepted else 'no (canonical acceptance is not ready)', next_action='origin owner — delivery is accepted; proceed with the separately authorized release or activation step.' if accepted else 'origin owner — inspect the malformed acceptance event.')
     else:
         reason = _safe_review_reason(payload.get('reason'), _NOTICE_REASON_LIMIT)
-        msg = _stop_notice(icon='⏸', board_tag=board_tag, who_tag='', task_id=implementation_task, headline='DELIVERY HOLD', title=title, reason=reason or 'delivery review is held', ready='no (delivery acceptance is held)', next_action=f"@{contract_owner or 'review owner'} — resolve the hold for {pair}, then submit the required evidence through the same canonical pair.")
+        msg = _stop_notice(icon='⏸', board_tag=board_tag, who_tag='', task_id=implementation_task, headline='DELIVERY HOLD', title=title, reason=reason or 'delivery review is held', ready='no (delivery acceptance is held)', next_action=hold_next_action(contract_owner, pair))
     return msg, wake_handoff, wake_review_detail
 
 
@@ -803,9 +811,9 @@ def _notice_review_requested(ev, n):
     if summary:
         lines = summary.strip().splitlines()
         wake_handoff = lines[0][:200] if lines else summary[:200]
-    reviewer = _safe_review_reason(payload.get('reviewer'), 48)
+    reviewer = unretired(_safe_review_reason(payload.get('reviewer'), 48))
     implementer = _safe_review_reason(payload.get('implementer'), 48)
-    contract_owner = _safe_review_reason(payload.get('owner'), 48)
+    contract_owner = live_owner(_safe_review_reason(payload.get('owner'), 48))
     if kind == 'review_handoff_required':
         review_task_id = _safe_review_reason(payload.get('review_task_id'), 48)
         if review_task_id:
@@ -814,9 +822,9 @@ def _notice_review_requested(ev, n):
         else:
             ready = 'no (canonical review task is missing)'
             next_action = f"@{contract_owner or 'review owner'} — create or assign exactly one independent review task, link it as a dependency child, attach its id to review_requirement, then complete this implementation handoff once to release it."
-    elif reviewer:
+    elif payload.get('reviewer'):
         ready = 'yes (canonical reviewer is assigned)'
-        next_action = f'@{reviewer} — independently review this same card; approve with complete or return it with request-changes. An OPEN/non-Draft PR is not review or acceptance proof.'
+        next_action = f"{'@' + reviewer if reviewer else 'review owner'} — independently review this same card; approve with complete or return it with request-changes. An OPEN/non-Draft PR is not review or acceptance proof."
     else:
         ready = 'no (canonical reviewer is unassigned)'
         origin = f'@{implementer}' if implementer else 'origin owner'
@@ -834,7 +842,7 @@ def _notice_changes_requested(ev, n):
     wake_handoff = wake_review_detail = None
     payload = ev.payload or {}
     reason = _safe_review_reason(payload.get('reason'))
-    reviewer = _safe_review_reason(payload.get('reviewer'), 48)
+    reviewer = unretired(_safe_review_reason(payload.get('reviewer'), 48))
     implementer = _safe_review_reason(payload.get('implementer'), 48)
     reason_text = reason or 'reviewer feedback requires changes'
     provenance = ''
@@ -1231,6 +1239,7 @@ _EVENT_FORMATTERS = {
     "delivery_changes_requested": _notice_delivery_phase_completed,
     "delivery_accepted": _notice_delivery_phase_completed,
     "delivery_review_hold": _notice_delivery_phase_completed,
+    "thread_unknown": thread_unknown_notice,
 }
 
 # Claim only what we render, so no other kind can ever reach a chat. 'archived'
@@ -1241,7 +1250,7 @@ TERMINAL_KINDS = ("created", "spawned", "still_working",
                   "blocked", "gave_up", "block_loop_detected",
                   "completed", "archived", "review_requested", "review_handoff_required",
                   "delivery_phase_completed", "delivery_changes_requested",
-                  "delivery_accepted", "delivery_review_hold")
+                  "delivery_accepted", "delivery_review_hold", "thread_unknown")
 
 # ONE-CARD: no wakes. A wake makes the origin agent take a turn and narrate into
 # the channel, which is the progress narration this redesign deletes.

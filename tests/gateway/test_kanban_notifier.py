@@ -1,4 +1,6 @@
 import asyncio
+import json
+from types import SimpleNamespace
 
 
 from gateway.config import Platform
@@ -797,3 +799,55 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+# ---------------------------------------------------------------------------
+# Meghann, 2026-09-25: never tag the retired @pr-reviewer, and ask once when a
+# card's Discord thread is unknown.
+# ---------------------------------------------------------------------------
+
+
+def test_delivery_hold_never_tags_a_retired_owner_and_mentions_the_humans(monkeypatch):
+    from hermes_cli import config as hermes_config
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    monkeypatch.setattr(hermes_config, "load_config_readonly",
+                        lambda: {"kanban": {"retired_assignees": {"pr-reviewer": "integrator"}}})
+    monkeypatch.setenv("REEFMIND_DISCORD_INTAKE_NOTIFY_USERS", "923685524860981310,143529998664335360")
+    ev = SimpleNamespace(kind="delivery_review_hold", payload={"head": "abc123", "reason": "evidence stale"})
+    n = SimpleNamespace(task=SimpleNamespace(assignee="backend", review_requirement={"owner": "pr-reviewer"}),
+                        sub={"task_id": "t_hold"}, d={}, title="hold card", board_tag="")
+
+    msg, _, _ = _EVENT_FORMATTERS["delivery_review_hold"](ev, n)
+
+    assert "pr-reviewer" not in msg
+    assert "<@923685524860981310> <@143529998664335360>" in msg
+
+
+def test_card_without_a_thread_asks_for_one_exactly_once(tmp_path, monkeypatch):
+    from hermes_cli import config as hermes_config
+    from gateway import kanban_watchers_notifier as notifier
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "no-thread.db"))
+    monkeypatch.setattr(hermes_config, "load_config_readonly",
+                        lambda: {"kanban": {"default_notify_target": {"reefmind": "chan-kanban"}}})
+    monkeypatch.setattr(notifier, "_triage_thread_for", lambda *a, **k: None)
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="orphan card", assignee="backend")
+        collector = notifier._Collector.__new__(notifier._Collector)
+        collector.notifier_profile = None
+        for _ in range(2):   # a second tick must not ask again
+            collector._ensure_default_subs(conn, "reefmind")
+        conn.execute("DELETE FROM kanban_notify_subs")   # nor after the sub is gone
+        collector._ensure_default_subs(conn, "reefmind")
+        asks = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='thread_unknown'",
+                            (tid,)).fetchall()
+    finally:
+        conn.close()
+
+    assert len(asks) == 1
+    ev = SimpleNamespace(kind="thread_unknown", payload=json.loads(asks[0]["payload"]))
+    msg, _, _ = notifier._EVENT_FORMATTERS["thread_unknown"](ev, SimpleNamespace(task=None, title="orphan card"))
+    assert (f"hermes kanban --board reefmind notify-subscribe {tid} --platform discord "
+            "--chat-id <forum> --thread-id <thread> --chat-type thread") in msg
