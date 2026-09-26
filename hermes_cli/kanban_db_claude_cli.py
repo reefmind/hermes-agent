@@ -302,6 +302,15 @@ def worker_prompt(task: Task, workspace: str) -> str:
         "native worker would. Where the protocol below says not to shell out to `hermes kanban <verb>`, that "
         "still holds: this command is the tool surface, `hermes kanban` is not.\n"
         "Exactly one of kanban_complete or kanban_block must succeed before you exit.\n\n"
+        "# Ending your turn ends this process\n"
+        "`claude -p` exits the moment you end your turn. Background shells, monitors and "
+        "'I'll resume when the watch completes' die with it, nothing wakes you, and the card is "
+        "marked crashed. Never end your turn to wait. Wait in the foreground: run blocking commands "
+        "such as `gh pr checks <n> --watch --fail-fast` or a `sleep 60` poll loop, with the Bash "
+        "timeout set up to 600000 ms, repeat as needed, and call kanban_heartbeat between waits. "
+        "Do not use run_in_background or a monitor for anything whose result you need. If a wait "
+        "cannot finish in this run, call kanban_block with the reason; never exit without "
+        "kanban_complete or kanban_block.\n\n"
         f"{KANBAN_GUIDANCE}"
     )
 
