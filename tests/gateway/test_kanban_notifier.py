@@ -814,14 +814,14 @@ def test_delivery_hold_never_tags_a_retired_owner_and_mentions_the_humans(monkey
     monkeypatch.setattr(hermes_config, "load_config_readonly",
                         lambda: {"kanban": {"retired_assignees": {"pr-reviewer": "integrator"}}})
     monkeypatch.setenv("REEFMIND_DISCORD_INTAKE_NOTIFY_USERS", "923685524860981310,143529998664335360")
-    ev = SimpleNamespace(kind="delivery_review_hold", payload={"head": "abc123", "reason": "evidence stale"})
+    ev = SimpleNamespace(kind="delivery_review_hold", payload={"head": "abc123", "reason": "reviewer parked or owned; operator decision required"})
     n = SimpleNamespace(task=SimpleNamespace(assignee="backend", review_requirement={"owner": "pr-reviewer"}),
                         sub={"task_id": "t_hold"}, d={}, title="hold card", board_tag="")
 
     msg, _, _ = _EVENT_FORMATTERS["delivery_review_hold"](ev, n)
 
     assert "pr-reviewer" not in msg
-    assert "<@923685524860981310> <@143529998664335360>" in msg
+    assert "Who: <@923685524860981310> or <@143529998664335360> — " in msg
 
 
 def test_card_without_a_thread_asks_for_one_exactly_once(tmp_path, monkeypatch):
@@ -851,3 +851,100 @@ def test_card_without_a_thread_asks_for_one_exactly_once(tmp_path, monkeypatch):
     msg, _, _ = notifier._EVENT_FORMATTERS["thread_unknown"](ev, SimpleNamespace(task=None, title="orphan card"))
     assert (f"hermes kanban --board reefmind notify-subscribe {tid} --platform discord "
             "--chat-id <forum> --thread-id <thread> --chat-type thread") in msg
+
+
+# ---------------------------------------------------------------------------
+# Meghann, 2026-09-26: stop notices are at most three plain lines (plus the PR
+# url). No SHAs, card ids, board tags or role handles in the rendered text.
+# ---------------------------------------------------------------------------
+
+_SHA = "a1efddf0" * 5
+_PR = "https://github.com/millermindsolutions-com/reefmind-project/pull/3627"
+
+
+def _plain_n(status="blocked", pending=()):
+    task = SimpleNamespace(id="t_15cc7fda", assignee="backend", status=status, result="", branch_name=None,
+                           title="INT-3623 implementation · Automatic asset content fingerprints (replace ?v= pins)",
+                           review_requirement={"owner": "pr-reviewer"})
+    return SimpleNamespace(task=task, sub={"task_id": "t_15cc7fda"}, d={"pending_parents": list(pending), "pr_urls": []},
+                           title=task.title, board_tag="[reefmind] ", board_slug="reefmind", task_id="t_15cc7fda")
+
+
+def test_delivery_hold_renders_the_plain_worked_example(monkeypatch):
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    monkeypatch.setenv("REEFMIND_DISCORD_INTAKE_NOTIFY_USERS", "923685524860981310,143529998664335360")
+    ev = SimpleNamespace(kind="delivery_review_hold", payload={
+        "head": _SHA, "implementation_task": "t_15cc7fda", "review_task": "t_27a96b9f",
+        "reason": "reviewer parked or owned; operator decision required", "evidence": {"artifact": _PR}})
+
+    msg, _, _ = _EVENT_FORMATTERS["delivery_review_hold"](ev, _plain_n())
+
+    assert msg == ("⏸ INT-3623 Automatic asset content fingerprints — stuck\n"
+                   "Why: The reviewer stopped before finishing.\n"
+                   "Who: <@923685524860981310> or <@143529998664335360> — say retry or drop.\n"
+                   f"{_PR}")
+
+
+def test_every_stop_notice_is_short_and_free_of_ids_shas_and_roles(monkeypatch):
+    import re
+    from gateway import kanban_watchers_notifier as notifier
+
+    monkeypatch.setenv("REEFMIND_DISCORD_INTAKE_NOTIFY_USERS", "923685524860981310,143529998664335360")
+    noisy = {"head": _SHA, "implementation_task": "t_15cc7fda", "review_task": "t_27a96b9f",
+             "reason": f"full exact commit SHA required for {_SHA} @integrator t_27a96b9f",
+             "error": f"@backend crashed at {_SHA}", "summary": f"t_15cc7fda done at {_SHA} @orchestrator",
+             "findings": "exact head evidence stale", "reviewer": "pr-reviewer", "owner": "pr-reviewer",
+             "implementer": "backend", "limit_seconds": 3600, "recurrences": 3}
+    cases = [
+        (notifier._notice_completed, "completed", {"completion_kind": "delivery_review_result", "review_handoff": {}}),
+        (notifier._notice_completed, "completed", {"completion_kind": "implementation_ready_for_review",
+                                                   "review_handoff": {"review_task_id": "t_27a96b9f"}}),
+        (notifier._notice_delivery_phase_completed, "delivery_phase_completed", {"evidence": {"artifact": "x"}}),
+        (notifier._notice_delivery_phase_completed, "delivery_changes_requested", {}),
+        (notifier._notice_delivery_phase_completed, "delivery_accepted", {"acceptance": "ready"}),
+        (notifier._notice_delivery_phase_completed, "delivery_accepted", {}),
+        (notifier._notice_delivery_phase_completed, "delivery_review_hold", {}),
+        (notifier._notice_blocked, "dependency_wait", {}),
+        (notifier._notice_blocked, "blocked", {"kind": "needs_input"}),
+        (notifier._notice_gave_up, "gave_up", {}),
+        (notifier._notice_crashed, "crashed", {}),
+        (notifier._notice_timed_out, "timed_out", {}),
+        (notifier._notice_review_requested, "review_handoff_required", {}),
+        (notifier._notice_review_requested, "review_requested", {}),
+        (notifier._notice_block_loop_detected, "block_loop_detected", {}),
+    ]
+    for fmt, kind, extra in cases:
+        ev = SimpleNamespace(kind=kind, payload={**noisy, **extra})
+        pending = [{"id": "t_0badc0de", "title": "parent", "status": "running"}] if kind == "dependency_wait" else ()
+        msg, _, _ = fmt(ev, _plain_n(pending=pending))
+        lines = msg.splitlines()
+        assert len(lines) <= 4 and lines[1].startswith("Why: ") and lines[2].startswith("Who: "), (kind, msg)
+        assert not re.search(r"\b[0-9a-f]{40}\b|\bt_[0-9a-f]{6,}|(?<!<)@[A-Za-z]|\[reefmind\]", msg), (kind, msg)
+        assert not re.search(r"canonical pair|artifact identity|exact head|evidence|Ready:", msg), (kind, msg)
+
+
+def test_every_known_hold_reason_maps_to_a_plain_sentence():
+    from gateway.kanban_watchers_notifier_plain import UNKNOWN_REASON, plain_reason
+
+    reasons = [
+        "reviewer parked or owned; operator decision required",
+        "reviewer parked or failed; operator decision required",
+        "reviewer did not finish normally; operator decision required",
+        "artifact identity changed; continue the same PR/branch or cite the owner",
+        "review has no exact PASS or actionable BLOCK",
+        "handoff must name the existing sole independent review child",
+        "legacy review handoff lacks an exact head; implementer must resubmit delivery_review",
+        "canonical review_requirement required",
+        "review child has additional dependencies",
+        "full exact commit SHA required",
+        "stable PR or repository/branch artifact identity required",
+        "review head missing or stale",
+        "review passed; delivery gates still incomplete: CI",
+        "exact-head proof gates: nonDraft",
+        "focused check evidence required",
+        "implementation has unresolved failure or claim",
+    ]
+    for reason in reasons:
+        assert plain_reason(reason)[0] != UNKNOWN_REASON, reason
+    assert plain_reason("something new")[0] == UNKNOWN_REASON

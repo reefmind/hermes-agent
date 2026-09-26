@@ -19,8 +19,11 @@ from typing import Any, Callable, Optional
 from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
+from gateway.kanban_watchers_notifier_plain import (
+    IN_PROGRESS, NEEDS_YOU, NO_ONE, READY, brett, decide, hold_who, plain_notice, plain_reason,
+)
 from gateway.kanban_watchers_notifier_owners import (
-    THREAD_UNKNOWN_SQL, hold_next_action, live_owner, thread_unknown_notice, unretired,
+    THREAD_UNKNOWN_SQL, thread_unknown_notice, unretired,
 )
 from gateway.wake import session_owned_by_profile
 
@@ -496,41 +499,26 @@ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], 
 
 
 _NOTICE_REASON_LIMIT = 400
-_SELF_ADVANCING_STATUSES = ("ready", "running", "todo", "review", "in_review")
+def _stop_notice(*, icon: str, title: str, status: str, why: str, who: str,
+                 ev: Any = None, n: Any = None) -> str:
+    """Render one stop notice in plain English (see kanban_watchers_notifier_plain).
 
-def _ready_line(task: Any) -> str:
-    """Answer "will the board move this on its own?" — the Ready yes/no."""
-    status = str(getattr(task, "status", "") or "unknown")
-    if status in _SELF_ADVANCING_STATUSES:
-        return f"yes ({status} — the board will pick this up on its own)"
-    return f"no ({status} — nothing moves until a human acts)"
-
-
-def _stop_notice(
-    *,
-    icon: str,
-    board_tag: str,
-    who_tag: str,
-    task_id: str,
-    headline: str,
-    title: str,
-    reason: str,
-    ready: str,
-    next_action: str,
-) -> str:
-    """Render one durable, actionable stop notice.
-
-    Every stop carries the same four answers, because an operator reading a
-    ping in a busy thread needs all four to act without opening the board:
-    which card, what exactly stopped it, whether the board will recover on its
-    own, and who does what next.
+    Three lines -- ticket and status, why, who acts -- plus the PR url when the
+    event or the card names one. Card ids, SHAs and roles stay in the payload.
     """
-    lines = [f"{icon} {board_tag}{who_tag}Kanban {task_id} {headline} — {title}"]
-    if reason:
-        lines.append(f"Reason: {reason}")
-    lines.append(f"Ready: {ready}")
-    lines.append(f"Next: {next_action}")
-    return "\n".join(lines)
+    return plain_notice(icon=icon, title=title, status=status, why=why, who=who,
+                        pr_url=_notice_pr_url(ev, n) if ev is not None else None)
+
+
+def _notice_pr_url(ev: Any, n: Any) -> Optional[str]:
+    """The PR this notice is about: the payload first, then the card's own handoffs."""
+    found = _ONE_CARD_PR_RE.search(json.dumps(getattr(ev, "payload", None) or {}, default=str))
+    if found:
+        return found.group(0)
+    try:
+        return _one_card_pr_url(ev, n)
+    except Exception:
+        return None
 
 
 # --- Per-event message formatting: kind -> (msg, wake_handoff, wake_review_detail) ---
@@ -661,13 +649,9 @@ def _notice_completed(ev, n):
     completion_kind = str((ev.payload or {}).get('completion_kind') or 'final')
     review_handoff = (ev.payload or {}).get('review_handoff')
     if completion_kind == 'delivery_review_result':
-        implementation_task = _safe_review_reason(review_handoff.get('implementation_task_id'), 48) if isinstance(review_handoff, dict) else ''
-        review_owner = live_owner(_safe_review_reason(review_handoff.get('owner'), 48)) if isinstance(review_handoff, dict) else ''
-        msg = _stop_notice(icon='🧾', board_tag=board_tag, who_tag=tag, task_id=sub['task_id'], headline='REVIEW RESULT RECORDED', title=title, reason=_safe_review_reason(payload_summary or 'independent review run completed', _NOTICE_REASON_LIMIT), ready='no (the review result is intermediate; the delivery controller has not accepted it)', next_action=f"@{review_owner or 'review owner'} — evaluate this result through the canonical delivery controller" + (f' for implementation task {implementation_task}.' if implementation_task else '.'))
+        msg = _stop_notice(icon='🧾', title=title, status=IN_PROGRESS, why='The review finished; the board is checking the result.', who=NO_ONE, ev=ev, n=n)
     elif completion_kind == 'implementation_ready_for_review' and isinstance(review_handoff, dict):
-        review_task_id = _safe_review_reason(review_handoff.get('review_task_id'), 48)
-        review_owner = live_owner(_safe_review_reason(review_handoff.get('owner'), 48))
-        msg = _stop_notice(icon='👀', board_tag=board_tag, who_tag='', task_id=sub['task_id'], headline='REVIEW HANDOFF', title=title, reason=_safe_review_reason(payload_summary or 'implementation ready', _NOTICE_REASON_LIMIT), ready='no (implementation ready for independent review; acceptance is pending)', next_action=f"@{review_owner or 'review owner'} — ensure {review_task_id or 'the canonical review task'} is independently reviewed. This implementation handoff is not final acceptance.")
+        msg = _stop_notice(icon='👀', title=title, status=IN_PROGRESS, why='The build is done and waiting for review.', who=NO_ONE, ev=ev, n=n)
     else:
         msg = f"✔ {board_tag}{tag}Kanban {sub['task_id']} done — {title}{handoff}"
     return msg, wake_handoff, wake_review_detail
@@ -681,39 +665,23 @@ def _notice_delivery_phase_completed(ev, n):
     kind = ev.kind
     wake_handoff = wake_review_detail = None
     payload = ev.payload or {}
-    implementation_task = _safe_review_reason(payload.get('implementation_task'), 48) or sub['task_id']
-    review_task = _safe_review_reason(payload.get('review_task'), 48)
-    head = _safe_review_reason(payload.get('head'), 40)
-    pair = f'head {head}'
-    if review_task:
-        pair += f'; review task {review_task}'
-    review_requirement = getattr(task, 'review_requirement', None) if task else None
-    if isinstance(review_requirement, str):
-        try:
-            review_requirement = json.loads(review_requirement)
-        except (TypeError, ValueError):
-            review_requirement = {}
-    if not isinstance(review_requirement, dict):
-        review_requirement = {}
-    contract_owner = live_owner(_safe_review_reason(review_requirement.get('owner'), 48))
+    # Card ids, the head SHA and the review pair stay in the payload and logs.
     if kind == 'delivery_phase_completed':
-        evidence = payload.get('evidence')
-        evidence = evidence if isinstance(evidence, dict) else {}
-        artifact = _safe_review_reason(evidence.get('artifact'), 120)
-        checks = evidence.get('checks')
-        check_count = len(checks) if isinstance(checks, list) else 0
-        evidence_text = f'; evidence {artifact}, {check_count} focused check(s)' if artifact else f'; {check_count} focused check(s) recorded'
-        msg = _stop_notice(icon='👀', board_tag=board_tag, who_tag='', task_id=implementation_task, headline='PHASE COMPLETE', title=title, reason=f'{pair}{evidence_text}; acceptance pending', ready='no (independent review and acceptance are pending)', next_action=f"review task {review_task or 'named in the contract'} — independently review exact head {head}.")
+        msg = _stop_notice(icon='👀', title=title, status=IN_PROGRESS, why='The build is done and waiting for review.', who=NO_ONE, ev=ev, n=n)
     elif kind == 'delivery_changes_requested':
         findings = _safe_review_reason(payload.get('findings'), _NOTICE_REASON_LIMIT)
-        msg = _stop_notice(icon='🛑', board_tag=board_tag, who_tag='', task_id=implementation_task, headline='CHANGES REQUESTED', title=title, reason=findings or 'reviewer requested changes', ready='no (this generation is not accepted)', next_action=f'{owner} — address the findings and submit a new exact-head generation; prior {pair}.')
+        msg = _stop_notice(icon='🛑', title=title, status=IN_PROGRESS, why='The review asked for changes.', who=NO_ONE, ev=ev, n=n)
         wake_review_detail = findings
     elif kind == 'delivery_accepted':
         accepted = payload.get('acceptance') == 'ready'
-        msg = _stop_notice(icon='✅', board_tag=board_tag, who_tag='', task_id=implementation_task, headline='DELIVERY ACCEPTED', title=title, reason=f'canonical independent review accepted {pair}' if accepted else f'acceptance metadata is incomplete for {pair}', ready='yes (canonical acceptance is ready)' if accepted else 'no (canonical acceptance is not ready)', next_action='origin owner — delivery is accepted; proceed with the separately authorized release or activation step.' if accepted else 'origin owner — inspect the malformed acceptance event.')
+        if accepted:
+            msg = _stop_notice(icon='✅', title=title, status=READY, why='Review passed and the checks are green.', who=brett('review and merge the PR.'), ev=ev, n=n)
+        else:
+            msg = _stop_notice(icon='✅', title=title, status=NEEDS_YOU, why=plain_reason('')[0], who=brett('take a look.'), ev=ev, n=n)
     else:
         reason = _safe_review_reason(payload.get('reason'), _NOTICE_REASON_LIMIT)
-        msg = _stop_notice(icon='⏸', board_tag=board_tag, who_tag='', task_id=implementation_task, headline='DELIVERY HOLD', title=title, reason=reason or 'delivery review is held', ready='no (delivery acceptance is held)', next_action=hold_next_action(contract_owner, pair))
+        why, who, status = hold_who(reason)
+        msg = _stop_notice(icon='⏸', title=title, status=status, why=why, who=who, ev=ev, n=n)
     return msg, wake_handoff, wake_review_detail
 
 
@@ -727,25 +695,27 @@ def _notice_blocked(ev, n):
     payload = ev.payload or {}
     raw_reason = payload.get('reason')
     block_kind = str(payload.get('kind') or '').strip()
-    ready = _ready_line(task)
     if kind == 'dependency_wait':
         pending = d.get('pending_parents') or []
         if pending:
-            waiting_on = ', '.join((f"{parent['id']} “{str(parent.get('title') or '')[:60]}” ({parent.get('status')})" for parent in pending[:5]))
-            next_action = f'nothing for you yet — this card resumes when {waiting_on} finishes.'
+            next_action = dict(status=IN_PROGRESS, why='It is waiting for another card to finish.', who=NO_ONE)
         else:
-            next_action = f'{owner} — this card declared a dependency but has no unsatisfied dependency on the board, so it will be re-dispatched and repeat the same work. Link the card it is really waiting on, or re-block it as a real blocker (`--kind needs_input`).'
-        msg = _stop_notice(icon='⏳', board_tag=board_tag, who_tag=tag, task_id=sub['task_id'], headline='is waiting on a dependency', title=title, reason=_safe_review_reason(raw_reason, _NOTICE_REASON_LIMIT), ready=ready, next_action=next_action)
+            next_action = dict(status=NEEDS_YOU, why='It says it is waiting, but nothing on the board is blocking it.',
+                               who=decide('say what it waits on, or drop it.'))
+        msg = _stop_notice(icon='⏳', title=title, **next_action, ev=ev, n=n)
     else:
-        if payload.get('routed_from') == 'dependency':
-            next_action = f"{owner} — this arrived as a dependency wait with nothing to wait for, so it was held here instead of being re-dispatched. Resolve it, then `hermes kanban unblock {sub['task_id']}`."
+        why, _, known = plain_reason(raw_reason)
+        if known:
+            next_action = why
+        elif payload.get('routed_from') == 'dependency':
+            next_action = 'It said it was waiting, but nothing on the board is blocking it.'
         elif block_kind == 'capability':
-            next_action = f"{owner} — grant the missing tool/permission above, then `hermes kanban unblock {sub['task_id']}`."
+            next_action = 'A worker is missing a tool or permission.'
         elif block_kind == 'needs_input':
-            next_action = f"{owner} — answer the blocker above, then `hermes kanban unblock {sub['task_id']}`."
+            next_action = 'A worker needs an answer to continue.'
         else:
-            next_action = f"{owner} — resolve the blocker above, then `hermes kanban unblock {sub['task_id']}`."
-        msg = _stop_notice(icon='⏸', board_tag=board_tag, who_tag=tag, task_id=sub['task_id'], headline='blocked', title=title, reason=_safe_review_reason(raw_reason, _NOTICE_REASON_LIMIT), ready=ready, next_action=next_action)
+            next_action = why
+        msg = _stop_notice(icon='⏸', title=title, status=NEEDS_YOU, why=next_action, who=decide('answer in this thread.'), ev=ev, n=n)
     return msg, wake_handoff, wake_review_detail
 
 
@@ -756,7 +726,7 @@ def _notice_gave_up(ev, n):
     owner = f"@{task.assignee}" if task and task.assignee else "origin owner"
     kind = ev.kind
     wake_handoff = wake_review_detail = None
-    msg = _stop_notice(icon='✖', board_tag=board_tag, who_tag=tag, task_id=sub['task_id'], headline='gave up after repeated spawn failures', title=title, reason=_safe_review_reason((ev.payload or {}).get('error'), _NOTICE_REASON_LIMIT), ready=_ready_line(task), next_action=f'{owner} — fix the spawn failure above (profile venv, PATH, credentials, quota), then requeue the card. The dispatcher has stopped retrying it.')
+    msg = _stop_notice(icon='✖', title=title, status=NEEDS_YOU, why='It kept failing to start, so the board stopped retrying.', who=decide('fix the setup, then say retry.'), ev=ev, n=n)
     return msg, wake_handoff, wake_review_detail
 
 
@@ -767,7 +737,7 @@ def _notice_crashed(ev, n):
     owner = f"@{task.assignee}" if task and task.assignee else "origin owner"
     kind = ev.kind
     wake_handoff = wake_review_detail = None
-    msg = _stop_notice(icon='✖', board_tag=board_tag, who_tag=tag, task_id=sub['task_id'], headline='worker crashed (pid gone)', title=title, reason=_safe_review_reason((ev.payload or {}).get('error') or 'the worker exited without a terminal lifecycle call', _NOTICE_REASON_LIMIT), ready=_ready_line(task), next_action=f'{owner} — operator decision required: requeue this card or block it with the real reason. Confirm the outcome yourself rather than assuming a retry.')
+    msg = _stop_notice(icon='✖', title=title, status=NEEDS_YOU, why='The worker stopped unexpectedly.', who=decide('say retry or drop.'), ev=ev, n=n)
     return msg, wake_handoff, wake_review_detail
 
 
@@ -781,7 +751,7 @@ def _notice_timed_out(ev, n):
     limit = 0
     if ev.payload and ev.payload.get('limit_seconds'):
         limit = int(ev.payload['limit_seconds'])
-    msg = _stop_notice(icon='⏱', board_tag=board_tag, who_tag=tag, task_id=sub['task_id'], headline='timed out', title=title, reason=f'exceeded max_runtime={limit}s', ready=_ready_line(task), next_action=f'{owner} — decide whether to raise max_runtime, split the card, or block it. Do not assume the retry will finish any faster.')
+    msg = _stop_notice(icon='⏱', title=title, status=NEEDS_YOU, why=f'It ran past its {max(1, round(limit / 60))}-minute limit.' if limit else 'It ran past its time limit.', who=decide('say retry, split, or drop.'), ev=ev, n=n)
     return msg, wake_handoff, wake_review_detail
 
 
@@ -811,25 +781,14 @@ def _notice_review_requested(ev, n):
     if summary:
         lines = summary.strip().splitlines()
         wake_handoff = lines[0][:200] if lines else summary[:200]
-    reviewer = unretired(_safe_review_reason(payload.get('reviewer'), 48))
-    implementer = _safe_review_reason(payload.get('implementer'), 48)
-    contract_owner = live_owner(_safe_review_reason(payload.get('owner'), 48))
-    if kind == 'review_handoff_required':
-        review_task_id = _safe_review_reason(payload.get('review_task_id'), 48)
-        if review_task_id:
-            ready = 'no (canonical review generation awaits handoff)'
-            next_action = f"@{contract_owner or 'review owner'} — hand exact generation evidence to review task {review_task_id}; acceptance remains pending."
-        else:
-            ready = 'no (canonical review task is missing)'
-            next_action = f"@{contract_owner or 'review owner'} — create or assign exactly one independent review task, link it as a dependency child, attach its id to review_requirement, then complete this implementation handoff once to release it."
-    elif payload.get('reviewer'):
-        ready = 'yes (canonical reviewer is assigned)'
-        next_action = f"{'@' + reviewer if reviewer else 'review owner'} — independently review this same card; approve with complete or return it with request-changes. An OPEN/non-Draft PR is not review or acceptance proof."
+    waiting = dict(status=IN_PROGRESS, why='The build is done and waiting for review.', who=NO_ONE)
+    if kind == 'review_handoff_required' and not _safe_review_reason(payload.get('review_task_id'), 48):
+        next_action = dict(status=IN_PROGRESS, why=plain_reason('sole independent review child')[0], who=NO_ONE)
+    elif kind == 'review_handoff_required' or payload.get('reviewer'):
+        next_action = waiting
     else:
-        ready = 'no (canonical reviewer is unassigned)'
-        origin = f'@{implementer}' if implementer else 'origin owner'
-        next_action = f'origin owner ({origin}) — assign exactly one independent reviewer to this same card. Do not create or reuse an unrelated child.'
-    msg = _stop_notice(icon='👀', board_tag=board_tag, who_tag='', task_id=sub['task_id'], headline='REVIEW HANDOFF', title=title, reason=_safe_review_reason(summary or 'implementation entered structured review', _NOTICE_REASON_LIMIT), ready=ready, next_action=next_action)
+        next_action = dict(status=NEEDS_YOU, why='No one is assigned to review it.', who=decide('pick a reviewer.'))
+    msg = _stop_notice(icon='👀', title=title, **next_action, ev=ev, n=n)
     return msg, wake_handoff, wake_review_detail
 
 
@@ -865,7 +824,7 @@ def _notice_block_loop_detected(ev, n):
     payload = ev.payload or {}
     recurrences = payload.get('recurrences')
     rc = f' (blocked {recurrences}x for the same cause)' if recurrences else ''
-    msg = _stop_notice(icon='🛑', board_tag=board_tag, who_tag=tag, task_id=sub['task_id'], headline=f'routed to TRIAGE{rc}', title=title, reason=_safe_review_reason(payload.get('reason'), _NOTICE_REASON_LIMIT), ready=_ready_line(task), next_action=f'{owner} — the unblock loop was broken deliberately; a human has to decide what changes before this card runs again. Unblocking it as-is will loop.')
+    msg = _stop_notice(icon='🛑', title=title, status=NEEDS_YOU, why='It keeps stopping for the same reason.', who=decide('decide what changes before it runs again.'), ev=ev, n=n)
     return msg, wake_handoff, wake_review_detail
 
 _EVENT_FORMATTERS = {

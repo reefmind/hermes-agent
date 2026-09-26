@@ -8,7 +8,7 @@ asked where they belong.
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any
 
 # The existing intake notify-users setting (~/.hermes/.env): the people who own
 # human decisions on the ReefMind board. Not a new knob.
@@ -23,22 +23,6 @@ def unretired(name: Any) -> str:
     try:
         from hermes_cli.kanban_db import _remap_retired_assignee
         return str(_remap_retired_assignee(name)[0] or "").strip()
-    except Exception:
-        return ""
-
-
-def live_owner(name: Any) -> str:
-    """The profile to name for ``name``, or "" when it must not be named.
-
-    Retired profiles resolve through ``kanban.retired_assignees`` -- the same
-    mapping ``_remap_retired_assignee`` records as ``retired_from`` -- so a stale
-    ``owner=pr-reviewer`` in an event names ``integrator``, never the retired one.
-    A name that is not a live profile is unknown and is dropped too.
-    """
-    resolved = unretired(name)
-    try:
-        from hermes_cli.profiles import profile_exists
-        return resolved if resolved and profile_exists(resolved) else ""
     except Exception:
         return ""
 
@@ -75,10 +59,3 @@ def thread_unknown_notice(ev: Any, n: Any) -> tuple:
     ]
     return "\n".join(lines), None, None
 
-
-def hold_next_action(owner: Optional[str], pair: str) -> str:
-    """DELIVERY HOLD next action: a real person decides; a live owner submits."""
-    who = decision_mentions() or "origin owner"
-    submit = f"@{owner} then submits" if owner else "then submit"
-    return (f"{who} — decide the hold for {pair}; {submit} the required evidence "
-            "through the same canonical pair.")
