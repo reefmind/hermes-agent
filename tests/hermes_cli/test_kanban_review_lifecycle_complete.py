@@ -758,16 +758,31 @@ def test_creation_can_bind_and_gate_precreated_canonical_review(conn) -> None:
 
 
 def test_creation_rejects_stale_or_non_independent_canonical_review(conn) -> None:
+    # A review card on the implementer's profile is routed to the named owner,
+    # never accepted as a self-review.
     self_review_id = kb.create_task(conn, title="Self review", assignee="builder")
+    kb.create_task(
+        conn,
+        title="Implement export",
+        assignee="builder",
+        review_requirement={
+            "required": True,
+            "owner": "techlead",
+            "review_task_id": self_review_id,
+        },
+    )
+    assert kb.get_task(conn, self_review_id).assignee == "techlead"
+    # With nobody independent named, it still refuses.
+    other_self_review_id = kb.create_task(conn, title="Self review 2", assignee="builder")
     with pytest.raises(ValueError, match="independent reviewer"):
         kb.create_task(
             conn,
-            title="Implement export",
+            title="Implement import",
             assignee="builder",
             review_requirement={
                 "required": True,
-                "owner": "techlead",
-                "review_task_id": self_review_id,
+                "owner": "builder",
+                "review_task_id": other_self_review_id,
             },
         )
 
@@ -1031,20 +1046,21 @@ def test_required_review_rejects_stale_non_dependency_and_implementer_bindings(c
         assignee="builder",
         parents=[implementation_id],
     )
-    with pytest.raises(ValueError, match="independent reviewer"):
-        kb.complete_task(
-            conn,
-            implementation_id,
-            summary="implementation ready",
-            metadata={
-                "review_requirement": {
-                    "required": True,
-                    "owner": "techlead",
-                    "review_task_id": same_reviewer_id,
-                }
-            },
-            expected_run_id=implementation.current_run_id,
-        )
+    # The implementer's own profile is routed to the named owner, not accepted.
+    assert kb.complete_task(
+        conn,
+        implementation_id,
+        summary="implementation ready",
+        metadata={
+            "review_requirement": {
+                "required": True,
+                "owner": "techlead",
+                "review_task_id": same_reviewer_id,
+            }
+        },
+        expected_run_id=implementation.current_run_id,
+    )
+    assert kb.get_task(conn, same_reviewer_id).assignee == "techlead"
 
 
 def test_required_review_contract_cannot_be_downgraded_or_rebound(conn) -> None:
@@ -1382,3 +1398,43 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         )
     assert kb.complete_task(conn, ok_id, summary="done")
     assert _failures(conn, ok_id) == 0
+
+
+def test_self_assigned_review_card_is_routed_to_the_named_owner(conn) -> None:
+    """A review card on the implementer's own profile goes to the requirement's owner.
+
+    Regression for 2026-09-27..10-02: three cards blocked for up to six days asking
+    Brett to run `hermes kanban assign <review> pr-reviewer` + `unblock` by hand,
+    because the handoff refused a review card that sat on the implementer's profile.
+    Independence is unchanged: the review still runs on a different profile, and
+    when the named owner IS the implementer there is nobody independent to route
+    to, so it still refuses.
+    """
+    implementation_id = kb.create_task(
+        conn, title="Implement export", assignee="builder",
+        review_requirement={"required": True, "owner": "techlead"},
+    )
+    review_id = kb.create_task(conn, title="Review export", assignee="builder", parents=[implementation_id])
+    implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
+    assert kb.complete_task(
+        conn, implementation_id, summary="implementation ready",
+        metadata={"review_requirement": {"required": True, "owner": "techlead", "review_task_id": review_id}},
+        expected_run_id=implementation.current_run_id,
+    )
+    assert kb.get_task(conn, review_id).assignee == "techlead"
+    routed = [e for e in kb.list_events(conn, review_id) if e.kind == "assigned"]
+    assert routed and routed[-1].payload.get("auto_routed_from") == "builder"
+
+    selfish_id = kb.create_task(
+        conn, title="Implement import", assignee="builder",
+        review_requirement={"required": True, "owner": "builder"},
+    )
+    self_review_id = kb.create_task(conn, title="Review import", assignee="builder", parents=[selfish_id])
+    run = kb.claim_task(conn, selfish_id, claimer="builder:2")
+    with pytest.raises(ValueError, match="independent reviewer"):
+        kb.complete_task(
+            conn, selfish_id, summary="implementation ready",
+            metadata={"review_requirement": {"required": True, "owner": "builder", "review_task_id": self_review_id}},
+            expected_run_id=run.current_run_id,
+        )
+    assert kb.get_task(conn, self_review_id).assignee == "builder"

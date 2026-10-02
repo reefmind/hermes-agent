@@ -1520,6 +1520,9 @@ def create_task(
                         "VALUES (?, ?)",
                         (task_id, canonical_review_id),
                     )
+                    _route_review_child_to_owner(
+                        conn, task_id, canonical_review_id, assignee, review_requirement
+                    )
                     _validate_canonical_review_child(
                         conn, task_id, canonical_review_id, assignee
                     )
@@ -3020,6 +3023,38 @@ def _merged_review_requirement(
     return incoming
 
 
+def _route_review_child_to_owner(
+    conn: sqlite3.Connection, implementation_task_id: str, review_task_id: str,
+    implementer: Optional[str], review_requirement: Optional[dict],
+) -> None:
+    """Move a review card off the implementer's own profile onto the named owner.
+
+    A review card created on the implementer's profile (or with no assignee) made
+    every handoff refuse with "must use an independent reviewer", and the worker
+    then parked the card asking a human to run `assign` + `unblock` (three cards,
+    up to six days, 2026-10-02). The requirement already names the owner, so do
+    that assignment here. Independence is unchanged: nothing moves when the owner
+    is the implementer, the owner now holds the implementation card itself (a
+    reassigned parent is not independent of its own review), or the review card is
+    already active; validation still runs afterwards.
+    """
+    owner = _canonical_assignee((review_requirement or {}).get("owner") or "") or None
+    implementer = _canonical_assignee(implementer) if implementer else None
+    holder = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (implementation_task_id,)).fetchone()
+    holder = _canonical_assignee(holder["assignee"]) if holder and holder["assignee"] else None
+    child = conn.execute("SELECT assignee, status FROM tasks WHERE id = ?", (review_task_id,)).fetchone()
+    if (child is None or not owner or owner in {implementer, holder}
+            or child["status"] in {"running", "review"}):
+        return
+    current = _canonical_assignee(child["assignee"]) if child["assignee"] else None
+    if current is not None and current != implementer:
+        return
+    conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (owner, review_task_id))
+    _append_event(conn, review_task_id, "assigned",
+                  {"assignee": owner, "auto_routed_from": current,
+                   "reason": "review card was on the implementer's profile; routed to the named review owner"})
+
+
 def _validate_canonical_review_child(
     conn: sqlite3.Connection,
     implementation_task_id: str,
@@ -3221,6 +3256,7 @@ def complete_task(conn: sqlite3.Connection, task_id: str, *, result: Optional[st
                 _append_event(conn, task_id, 'review_child_adopted',
                               {'review_task_id': adopted, 'implementer': implementer})
         if review_task_id:
+            _route_review_child_to_owner(conn, task_id, review_task_id, implementer, review_requirement)
             _validate_canonical_review_child(conn, task_id, review_task_id, implementer, generation_handoff=generation_handoff)
         canonical_parent = _canonical_review_parent(conn, task_id)
         if canonical_parent is not None:
