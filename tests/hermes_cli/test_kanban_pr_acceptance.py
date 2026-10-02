@@ -230,3 +230,43 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+def _unprotected_api(runs, statuses=()):
+    sha = "c" * 40
+
+    def api(endpoint, *, query=None, paginate=False, **_kw):
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": sha, "baseRefName": "main", "state": "OPEN", "baseRef": {"branchProtectionRule": None}}}}}
+        if "/rules/branches/" in endpoint:
+            return [[]]
+        if "/check-runs" in endpoint:
+            rs = [{"id": i, "head_sha": sha, "app": {"id": 1}, "html_url": "u", **r} for i, r in enumerate(runs)]
+            return [{"total_count": len(rs), "check_runs": rs}]
+        if "/statuses" in endpoint:
+            return [list(statuses)]
+        return {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+    return api
+
+
+@pytest.mark.parametrize("runs,ok", [
+    ([], False),  # no CI evidence at all
+    ([{"name": "Core", "status": "completed", "conclusion": "success"},
+      {"name": "Mobile", "status": "completed", "conclusion": "skipped"}], True),
+    ([{"name": "Core", "status": "completed", "conclusion": "success"},
+      {"name": "E2E", "status": "completed", "conclusion": "failure"}], False),
+    ([{"name": "Core", "status": "completed", "conclusion": "success"},
+      {"name": "E2E", "status": "in_progress", "conclusion": None}], False),
+    ([{"name": "Lint", "status": "completed", "conclusion": "skipped"}], False),
+])
+def test_unprotected_repo_gates_on_all_exact_head_checks(monkeypatch, runs, ok):
+    """Regression for 2026-10-02: a repo with no required checks refused every PR-bound
+    card outright. It now gates on all exact-head checks, which is strictly more than
+    nothing: any red or unfinished check, or no green check at all, still refuses."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    monkeypatch.setattr(acc, "_api", _unprotected_api(runs))
+    url = "https://github.com/acme/repo/pull/7"
+    receipt = acc.collect_acceptance(url, url)
+    assert receipt["ok"] is ok
+    assert receipt["head_sha"] == "c" * 40

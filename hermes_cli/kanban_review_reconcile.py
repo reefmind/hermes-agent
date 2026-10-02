@@ -278,7 +278,10 @@ def reconcile(conn):
                     hold(reason)
 
             if requirement.get("required") is not True or not requirement.get("owner"):
-                hold("canonical review_requirement required")
+                # A finished card with no review requirement has nothing left to
+                # gate; re-reporting it every tick only buried the real holds.
+                if parent["status"] != "done":
+                    hold("canonical review_requirement required")
                 continue
             if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
                 send_back("full exact commit SHA required",

@@ -886,3 +886,24 @@ def test_reviewer_without_exact_verdict_is_requeued_then_bounded(conn):
     assert result.delivery_holds
     assert len(_sendbacks(conn, child)) == rr.MAX_AUTO_SENDBACKS
     assert not any(e.kind == "delivery_accepted" for e in kb.list_events(conn, parent))
+
+
+def test_finished_card_without_review_requirement_is_not_a_hold(conn):
+    """A card already DONE with no review requirement has nothing left to gate.
+
+    Regression for 2026-10-02: ten finished cards (PRs merged by Brett on 09-27)
+    were re-reported as delivery holds on every tick, which also tripped the
+    'dispatcher stuck' warning. A card still in review keeps its hold.
+    """
+    def finished(status):
+        tid = kb.create_task(conn, title=f"Implementation {status}", assignee="integrator")
+        run = kb.claim_task(conn, tid, claimer="remote:test")
+        assert kb.complete_task(conn, tid, summary="done", expected_run_id=run.current_run_id,
+                                metadata={"delivery_review": {"head": A}})
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        conn.commit()
+        return tid
+    done_id, review_id = finished("done"), finished("review")
+    holds = {tid for tid, _ in tick(conn, max_spawn=0).delivery_holds}
+    assert done_id not in holds
+    assert review_id in holds

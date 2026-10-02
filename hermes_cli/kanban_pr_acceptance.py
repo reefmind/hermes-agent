@@ -143,9 +143,6 @@ def collect_acceptance(contract: str, published_pr: str | None,
                     required.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
-        if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
-            return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
         runs = [run for page in pages for run in page["check_runs"]]
@@ -154,6 +151,32 @@ def collect_acceptance(contract: str, published_pr: str | None,
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         outcomes = []
+        if not required:
+            # No ruleset/branch protection (reefmind-project's main, 2026-10-02):
+            # refusing outright blocked every PR-bound card and pushed workers to ask
+            # Brett to change branch rules. Gate strictly instead: every check that
+            # ran on the exact head must be green and at least one must have
+            # succeeded. Skipped/neutral (path-filtered) jobs neither pass nor block.
+            receipt["required_source"] = "all-head-checks"
+            latest_status = {}
+            for s in statuses:
+                if s["context"] not in latest_status or s["id"] > latest_status[s["context"]]["id"]:
+                    latest_status[s["context"]] = s
+            for check in runs + list(latest_status.values()):
+                is_run = "conclusion" in check
+                outcome = check.get("conclusion") if is_run else check["state"]
+                if is_run and check.get("status") == "completed" and outcome in {"skipped", "neutral"}:
+                    continue
+                classification = _classify(check, sha, outcome, is_run)
+                outcomes.append(classification)
+                receipt["checks"].append({"name": check.get("name") or check.get("context"), "id": check["id"],
+                    "url": check.get("html_url") or check.get("target_url"),
+                    "head_sha": check.get("head_sha", check.get("sha")),
+                    "classification": classification, "conclusion": outcome})
+            if "success" not in outcomes:
+                receipt["detail"] = ("No repository-required checks are configured and no check succeeded "
+                                     "on the exact PR head yet; wait for CI and retry.")
+                return receipt
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
