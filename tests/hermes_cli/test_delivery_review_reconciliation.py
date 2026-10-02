@@ -260,7 +260,11 @@ def test_successful_phase_supersedes_timeout_only(conn, monkeypatch, entrypoint,
     spawned = []
     for _ in range(3):
         spawned.extend(x[0] for x in tick(conn).spawned)
-    assert spawned == ([child] if guard is None else [])
+    # Missing check evidence is the implementer's to fix: it is sent back (never the
+    # reviewer). Every other guard is not worker-fixable and spawns nothing.
+    assert spawned == ([child] if guard is None else [parent] if guard == "checks" else [])
+    if guard == "checks":
+        assert [e.payload["reason"] for e in _sendbacks(conn, parent)] == ["focused check evidence required"]
     task = kb.get_task(conn, parent)
     assert task.consecutive_failures == (0 if guard is None else 2 if guard == "new_failure" else 1)
     assert task.last_failure_error == (None if guard is None else "new failure" if guard == "new_failure" else error)
@@ -317,8 +321,11 @@ def test_snapshot_change_preserves_canonical_identity(conn, monkeypatch, tmp_pat
     invoke(parent, second)
     result = tick(conn)
     if mismatch == "identity":
-        assert not result.spawned
-        assert any("artifact identity changed" in reason for _, reason in result.delivery_holds)
+        # Never the reviewer; the implementer is told to continue the original artifact.
+        assert [x[0] for x in result.spawned] == [parent]
+        findings = _sendbacks(conn, parent)[-1].payload["findings"]
+        assert identity in findings and "different-repository" in findings
+        assert not any(e.kind == "delivery_accepted" for e in kb.list_events(conn, parent))
         return
     assert [x[0] for x in result.spawned] == [child]
     assert not any(e.kind == "delivery_accepted" for e in kb.list_events(conn, parent))
@@ -505,10 +512,17 @@ def test_authorized_merged_successor_uses_same_pair(conn, monkeypatch, guard):
     out = json.loads(registry.dispatch("kanban_complete", {"summary": "Authorized successor phase", "metadata": data}))
     assert out.get("ok"), out
     dispatched = tick(conn)
-    assert [x[0] for x in dispatched.spawned] == ([child] if guard in {None, "reclaimed"} else [])
+    # An unauthorized successor never reaches the reviewer. The implementer is sent
+    # back to continue the original PR; only a parked reviewer stays a held decision.
+    sent_back = guard not in {None, "reclaimed", "held"}
+    assert [x[0] for x in dispatched.spawned] == (
+        [child] if guard in {None, "reclaimed"} else [parent] if sent_back else [])
     assert not tick(conn, max_spawn=0).spawned
     assert not any(e.kind == "delivery_accepted" and e.payload["head"] == B for e in kb.list_events(conn, parent))
-    if guard not in {None, "reclaimed"}:
+    if sent_back:
+        assert _sendbacks(conn, parent)
+        return
+    if guard == "held":
         assert dispatched.delivery_holds
         return
     verdict(conn, child, B, "PASS")
@@ -590,10 +604,14 @@ def test_same_sha_cannot_replenish_review_or_rework(conn):
     verdict(conn, child, A, "BLOCK")
     tick(conn, max_spawn=0)
     submit(conn, parent, child, A)
-    for _ in range(3):
-        assert not tick(conn).spawned
+    # The same SHA never buys a second review; the implementer is told to push a new commit.
+    spawned = [x[0] for _ in range(3) for x in tick(conn).spawned]
+    assert spawned == [parent]
     assert kb.get_task(conn, child).status == "done"
-    assert len([e for e in kb.list_events(conn, parent) if e.kind == "delivery_changes_requested"]) == 1
+    assert len(kb.list_runs(conn, child)) == 1
+    assert [e.payload["reason"] for e in _sendbacks(conn, parent)] == [
+        "this exact head was already consumed; submit a new generation"]
+    assert not any(e.kind == "delivery_accepted" for e in kb.list_events(conn, parent))
 
 
 def test_missing_reviewer_metadata_never_emits_review_approved(conn):
@@ -603,7 +621,7 @@ def test_missing_reviewer_metadata_never_emits_review_approved(conn):
     run = kb.get_task(conn, child)
     assert kb.complete_task(conn, child, summary="No structured verdict", expected_run_id=run.current_run_id)
     result = tick(conn)
-    assert result.delivery_holds
+    assert [x[0] for x in result.spawned] == [child]  # the reviewer is asked for a real verdict
     event = [e for e in kb.list_events(conn, child) if e.kind == "completed"][-1]
     assert event.payload["completion_kind"] == "delivery_review_result"
     assert event.payload["ready"] is False
@@ -630,6 +648,13 @@ def test_malformed_candidate_fails_closed_with_deduped_visible_hold(conn, tamper
         kb.create_task(conn, title="Unrelated child", assignee="qa", parents=[parent])
     run = kb.claim_task(conn, parent, claimer="remote:test")
     assert kb.complete_task(conn, parent, metadata=data, expected_run_id=run.current_run_id)
+    if tamper != "binding":
+        # Malformed evidence is the implementer's to fix: sent back once, never reviewed.
+        spawned = [x[0] for _ in range(3) for x in tick(conn).spawned]
+        assert spawned == [parent]
+        assert len(_sendbacks(conn, parent)) == 1
+        assert not any(e.kind == "delivery_accepted" for e in kb.list_events(conn, parent))
+        return
     for _ in range(3):
         result = tick(conn)
         assert not result.spawned
@@ -789,3 +814,75 @@ def test_unnamed_handoff_with_two_children_keeps_hold(conn):
     assert result.delivery_holds
     assert len(children_of(conn, parent)) == 2
     assert not any(e.kind == "delivery_review_sent" for e in kb.list_events(conn, parent))
+
+
+def _sendbacks(conn, tid):
+    return [e for e in kb.list_events(conn, tid)
+            if e.kind == "delivery_changes_requested" and e.payload.get("auto_sendback")]
+
+
+def test_worker_fixable_hold_is_sent_back_to_the_implementer_then_bounded(conn):
+    """A hold the implementer can fix returns the card to it with the exact missing item.
+
+    Regression for the 2026-09-29 stall: eight cards sat on delivery_review_hold for
+    days because nothing told the worker what was missing. The gate stays exactly as
+    strict (never accepted), and a worker that keeps resubmitting the same gap stops
+    after MAX_AUTO_SENDBACKS and is held for a human, so it cannot loop forever.
+    """
+    from hermes_cli import kanban_review_reconcile as rr
+    parent, child = pair(conn)
+    bad = candidate(child, A)
+    del bad["delivery_review"]["evidence"]["artifact"]
+    for attempt in range(rr.MAX_AUTO_SENDBACKS):
+        run = kb.claim_task(conn, parent, claimer="remote:test")
+        assert run
+        assert kb.complete_task(conn, parent, metadata=bad, expected_run_id=run.current_run_id)
+        tick(conn, max_spawn=0)
+        assert kb.get_task(conn, parent).status == "ready", attempt
+        assert len(_sendbacks(conn, parent)) == attempt + 1
+    assert "artifact" in _sendbacks(conn, parent)[-1].payload["findings"]
+    run = kb.claim_task(conn, parent, claimer="remote:test")
+    assert kb.complete_task(conn, parent, metadata=bad, expected_run_id=run.current_run_id)
+    result = tick(conn, max_spawn=0)
+    assert kb.get_task(conn, parent).status != "ready"
+    assert any("artifact identity required" in why for _, why in result.delivery_holds)
+    assert len(_sendbacks(conn, parent)) == rr.MAX_AUTO_SENDBACKS
+    assert not any(e.kind == "delivery_accepted" for e in kb.list_events(conn, parent))
+
+
+def test_new_pr_after_block_is_sent_back_naming_the_original_pr(conn):
+    parent, child = pair(conn)
+    submit(conn, parent, child, A)
+    tick(conn)
+    verdict(conn, child, A, "BLOCK")
+    tick(conn, max_spawn=0)
+    assert kb.get_task(conn, parent).status == "ready"
+    run = kb.claim_task(conn, parent, claimer="remote:test")
+    swapped = candidate(child, B)
+    swapped["delivery_review"]["evidence"]["artifact"] = "https://github.com/example/collector/pull/3341"
+    assert kb.complete_task(conn, parent, metadata=swapped, expected_run_id=run.current_run_id)
+    tick(conn, max_spawn=0)
+    assert kb.get_task(conn, parent).status == "ready"
+    findings = _sendbacks(conn, parent)[-1].payload["findings"]
+    assert "pull/3340" in findings and "pull/3341" in findings
+    assert not any(e.kind == "delivery_accepted" for e in kb.list_events(conn, parent))
+
+
+def test_reviewer_without_exact_verdict_is_requeued_then_bounded(conn):
+    from hermes_cli import kanban_review_reconcile as rr
+    parent, child = pair(conn)
+    submit(conn, parent, child, A)
+    tick(conn)
+    for attempt in range(rr.MAX_AUTO_SENDBACKS):
+        run = kb.get_task(conn, child)
+        assert run.status == "running", attempt
+        assert kb.complete_task(conn, child, summary="No structured verdict", expected_run_id=run.current_run_id)
+        result = tick(conn)
+        assert [x[0] for x in result.spawned] == [child], attempt
+    run = kb.get_task(conn, child)
+    assert kb.complete_task(conn, child, summary="No structured verdict", expected_run_id=run.current_run_id)
+    result = tick(conn)
+    assert not result.spawned
+    assert result.delivery_holds
+    assert len(_sendbacks(conn, child)) == rr.MAX_AUTO_SENDBACKS
+    assert not any(e.kind == "delivery_accepted" for e in kb.list_events(conn, parent))

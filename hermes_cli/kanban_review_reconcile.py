@@ -40,6 +40,20 @@ def _emit_once(conn, tid, kind, key, payload, run_id):
     return True
 
 
+# A hold the worker itself can fix is returned to that worker with the exact
+# missing item instead of parking the card silently (2026-09-29: eight cards sat
+# on a hold for days). Bounded per card so a worker that keeps resubmitting the
+# same gap ends on the original visible hold for a human. The gate is unchanged:
+# a send-back never accepts anything.
+MAX_AUTO_SENDBACKS = 3
+
+
+def _auto_sendbacks(conn, tid):
+    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='delivery_changes_requested'",
+                        (tid,)).fetchall()
+    return sum(1 for r in rows if _object(r["payload"]).get("auto_sendback") is True)
+
+
 def _claimed(conn, run):
     return run is not None and conn.execute(
         "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",
@@ -250,11 +264,26 @@ def reconcile(conn):
                 _emit_once(conn, tid, "delivery_review_hold", key + ":" + reason,
                            {**payload, "reason": reason}, rid)
 
+            def send_back(reason, findings, target=None, run_id=None):
+                """Return *target* (default: the implementer) to ready with *findings*."""
+                target, run_id = target or tid, run_id or rid
+                if (_auto_sendbacks(conn, target) < MAX_AUTO_SENDBACKS
+                        and _emit_once(conn, target, "delivery_changes_requested",
+                                       f"{key}:sendback:{run_id}:{reason}",
+                                       {**payload, "status": "ready", "auto_sendback": True,
+                                        "reason": reason, "findings": findings}, run_id)):
+                    conn.execute("UPDATE tasks SET status='ready', completed_at=NULL, result=NULL WHERE id=?",
+                                 (target,))
+                else:
+                    hold(reason)
+
             if requirement.get("required") is not True or not requirement.get("owner"):
                 hold("canonical review_requirement required")
                 continue
             if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
-                hold("full exact commit SHA required")
+                send_back("full exact commit SHA required",
+                          "delivery_review.head must be the full 40-character commit SHA of the PR head "
+                          f"you want reviewed (got {head!r}). Resubmit with the exact SHA.")
                 continue
             children = conn.execute(
                 "SELECT t.* FROM tasks t JOIN task_links l ON l.child_id=t.id WHERE l.parent_id=?",
@@ -282,18 +311,24 @@ def reconcile(conn):
             target = evidence.get("validation_target")
             if target is not None and (not isinstance(target, dict)
                     or target.get("kind") != "pr_head" or target.get("commit") != head):
-                hold("PR-head acceptance requires matching pr_head validation, not merged-checkout or deployed claims")
+                send_back("PR-head acceptance requires matching pr_head validation, not merged-checkout or deployed claims",
+                          "evidence.validation_target must be {\"kind\": \"pr_head\", \"commit\": \"" + head + "\"} "
+                          "for the PR head under review; merged-checkout or deployed claims do not count.")
                 continue
             artifact = evidence.get("artifact")
             if not isinstance(artifact, str) or not artifact.strip():
-                hold("stable PR or repository/branch artifact identity required")
+                send_back("stable PR or repository/branch artifact identity required",
+                          "delivery_review.evidence.artifact is missing. Set it to the PR URL "
+                          "(https://github.com/<org>/<repo>/pull/<n>) whose head is " + head + ", then resubmit.")
                 continue
             # Snapshot locations may change without changing logical identity.
             # A new artifact needs the pair owner's verified merged-successor
             # receipt; after enqueue, that latest phase becomes the stable anchor.
             identity = evidence.get("artifact_identity", artifact)
             if not isinstance(identity, str) or not identity.strip():
-                hold("nonempty stable artifact_identity required")
+                send_back("nonempty stable artifact_identity required",
+                          "delivery_review.evidence.artifact_identity is empty. Omit it or set it to the PR URL "
+                          f"{artifact}.")
                 continue
             previous = conn.execute(
                 "SELECT payload FROM task_events WHERE task_id=? AND kind='delivery_phase_completed' ORDER BY id DESC LIMIT 1",
@@ -303,13 +338,21 @@ def reconcile(conn):
             prior_evidence = _object(prior_phase.get("evidence"))
             if (previous and prior_evidence.get("artifact_identity", prior_evidence.get("artifact")) != identity
                     and not _authorized_successor(conn, parent, child, prior_phase, evidence, identity, head)):
-                hold("artifact identity changed; continue the same PR/branch or supply the owner's verified merged-successor receipt")
+                prior_identity = prior_evidence.get("artifact_identity", prior_evidence.get("artifact"))
+                send_back("artifact identity changed; continue the same PR/branch or supply the owner's verified merged-successor receipt",
+                          f"You submitted {identity} but this card's reviewed artifact is {prior_identity}. "
+                          f"Do not open a new PR: push your fix to the branch of {prior_identity} and resubmit "
+                          f"with artifact {prior_identity}. If {prior_identity} was merged and {identity} is its "
+                          "successor, the owner must record a verified merged-successor receipt instead.")
                 continue
             checks = evidence.get("checks")
             if not isinstance(checks, list) or not checks or not all(
                 isinstance(c, dict) and c.get("command") and c.get("result") == "passed" for c in checks
             ):
-                hold("focused check evidence required")
+                send_back("focused check evidence required",
+                          "delivery_review.evidence.checks must list every focused check you ran on " + head +
+                          " as {\"command\": ..., \"result\": \"passed\"}: at least one, all passed. "
+                          "Fix failing checks first; do not report a failing check as passed.")
                 continue
             if parent["claim_lock"] is not None or parent["worker_pid"] is not None:
                 hold("implementation has unresolved failure or claim")
@@ -351,7 +394,9 @@ def reconcile(conn):
                 continue
             gate_rework = _event(conn, tid, "delivery_changes_requested", key + ":gates")
             if sent["run_id"] != rid and gate_rework is None:
-                hold("this exact head was already consumed; submit a new generation")
+                send_back("this exact head was already consumed; submit a new generation",
+                          f"Head {head} was already reviewed. Push a new commit to the same PR that addresses "
+                          "the review findings, then resubmit with the new head SHA.")
                 continue
             if child["status"] != "done" or not _healthy(child):
                 if child["status"] in {"blocked", "triage"} or not _healthy(child) and child["claim_lock"] is None:
@@ -366,7 +411,9 @@ def reconcile(conn):
                 continue  # a prior review is never evidence for a new candidate
             review = _object(_object(reviewed["metadata"]).get("delivery_review"))
             if review.get("head") != head:
-                hold("review head missing or stale")
+                send_back("review head missing or stale",
+                          f"Review the exact head {head} and return delivery_review metadata with "
+                          "head, verdict PASS or BLOCK, and findings.", target=child_id, run_id=reviewed["id"])
                 continue
             if review.get("verdict") == "BLOCK" and isinstance(review.get("findings"), str) and review["findings"].strip():
                 if _emit_once(conn, tid, "delivery_changes_requested", key,
@@ -375,7 +422,10 @@ def reconcile(conn):
                     conn.execute("UPDATE tasks SET status='ready', completed_at=NULL, result=NULL WHERE id=?", (tid,))
                 continue
             if review.get("verdict") != "PASS":
-                hold("review has no exact PASS or actionable BLOCK")
+                send_back("review has no exact PASS or actionable BLOCK",
+                          f"Your review of {head} returned no usable verdict. Return delivery_review metadata "
+                          f"with head {head}, verdict PASS or BLOCK, and (for BLOCK) concrete findings.",
+                          target=child_id, run_id=reviewed["id"])
                 continue
             if not (evidence.get("ci_head") == head and evidence.get("ci") == "success"
                     and evidence.get("draft") is False and evidence.get("proof_head") == head
@@ -386,7 +436,10 @@ def reconcile(conn):
                                "findings": reason}, rid):
                     conn.execute("UPDATE tasks SET status='ready', completed_at=NULL, result=NULL WHERE id=?", (tid,))
                 else:
-                    hold("review passed; CI, nonDraft or proof gate missing/failed/stale")
+                    send_back("review passed; CI, nonDraft or proof gate missing/failed/stale",
+                              f"Review passed for {head}. On the same PR: get CI green on {head}, mark it "
+                              f"non-Draft, record exact-head proof, then resubmit evidence with ci_head={head}, "
+                              f"ci=success, draft=false, proof_head={head}, proof=passed.")
                 continue
             if _emit_once(conn, tid, "delivery_accepted", key,
                           {**payload, "review_run": reviewed["id"], "acceptance": "ready",
