@@ -3524,14 +3524,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
                 cmd,
                 cwd=workspace if os.path.isdir(workspace) else None,
                 stdin=subprocess.DEVNULL,
-                stdout=stamper.stdin if stamper is not None else log_f,
+                stdout=getattr(stamper, "stdin", None) or log_f,
                 stderr=subprocess.STDOUT,
                 env=env,
                 start_new_session=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
             )
     except OSError as exc:
-        if stamper is not None and stamper.stdin is not None:
+        if getattr(stamper, "stdin", None) is not None:
             stamper.stdin.close()
         log_f.close()
         if executor == _ccli.WORKER_EXECUTOR_CLAUDE_CLI:
@@ -3547,7 +3547,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
-    if stamper is not None and stamper.stdin is not None:  # BLOCK-CONTRACT-LOG-STAMP-CLOSE
+    if getattr(stamper, "stdin", None) is not None:  # BLOCK-CONTRACT-LOG-STAMP-CLOSE
         stamper.stdin.close()  # only the worker holds the write end now
     if _kb._IS_WINDOWS:
         _live_worker_procs[proc.pid] = proc
