@@ -930,8 +930,8 @@ _LONG_RUN_SQL = """
 # A card that came from a ticket reports next to its ticket; a card that came
 # from nowhere reports to #kanban. Nothing is ever silent.
 _TRIAGE_STATE_FILES = (
-    "~/.hermes/state/discord-github-intake.json",
-    "~/.hermes/state/mms-dms-discord-github-intake.json",
+    "state/discord-github-intake.json",
+    "state/mms-dms-discord-github-intake.json",
 )
 _TRIAGE_TICKET_RE = re.compile(r"\b((?:DMS-)?(?:BUG|INT|REQ|COST)-\d+)\b", re.I)
 _triage_cache = {"stamp": None, "by_task": {}, "by_ticket": {}}
@@ -969,7 +969,8 @@ def _triage_index():
     the most expensive thing the notifier does. Keyed on the files' mtimes, so an
     intake write is picked up on the next tick without a restart.
     """
-    paths = [Path(p).expanduser() for p in _TRIAGE_STATE_FILES]
+    from hermes_constants import get_hermes_home
+    paths = [get_hermes_home() / p for p in _TRIAGE_STATE_FILES]
     try:
         stamp = tuple(p.stat().st_mtime_ns if p.is_file() else 0 for p in paths)
     except OSError:

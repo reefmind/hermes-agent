@@ -1342,8 +1342,9 @@ def test_create_wires_explicit_review_requirement(worker_env):
     })
     task_id = json.loads(out)["task_id"]
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).review_requirement == {
             "required": True,
             "owner": "techlead",

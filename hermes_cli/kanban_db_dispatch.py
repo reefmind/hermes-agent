@@ -1210,7 +1210,10 @@ def _rate_limit_signature_in_log(task_id: str, tail_bytes: int = 65536) -> Optio
         paths.append(_kb.worker_logs_dir() / f"{task_id}.log")
     except Exception:
         pass
-    paths += [_Path(p) for p in _glob.glob(os.path.expanduser(f"~/.hermes/kanban/boards/*/logs/{task_id}.log"))]
+    try:
+        paths += [_Path(p) for p in _glob.glob(str(_kb.boards_root() / "*" / "logs" / f"{task_id}.log"))]
+    except Exception:
+        pass
     for path in paths:
         try:
             with open(path, "rb") as fh:

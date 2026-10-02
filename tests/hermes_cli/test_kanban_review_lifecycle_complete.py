@@ -1166,7 +1166,8 @@ def test_orphan_reconciler_cannot_treat_pr_prose_as_completion(conn) -> None:
             (implementation_id,),
         )
 
-    assert kb.reconcile_orphaned_running(conn) == [implementation_id]
+    from hermes_cli import kanban_db_dispatch as _kdd
+    assert _kdd.reconcile_orphaned_running(conn) == [implementation_id]
 
     implementation = kb.get_task(conn, implementation_id)
     review = kb.get_task(conn, review_id)

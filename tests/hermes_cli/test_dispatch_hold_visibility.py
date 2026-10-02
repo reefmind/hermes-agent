@@ -327,7 +327,7 @@ def test_diagnostics_surface_a_held_ready_task(conn):
     d = diags["respawn_guard_hold"]
     assert "active_pr" in d.detail or "active_pr" in json.dumps(d.data)
     assert d.severity in {"warning", "error"}
-    assert "respawn_guard_hold" in kd.DIAGNOSTIC_KINDS
+    assert kd._rule_respawn_guard_hold in kd._RULES
 
 
 def test_no_hold_diagnostic_once_the_task_is_running(conn):

@@ -12,6 +12,7 @@ from agent.kanban_stop import (
     session_called_kanban_terminal,
 )
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -175,7 +176,7 @@ def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
 @pytest.fixture
 def kanban_conn(tmp_path: Path, clear_kanban_env):
     db_path = tmp_path / "kanban.db"
-    conn = kb.connect(db_path)
+    conn = kbc.connect(db_path)
     clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db_path))
     try:
         yield conn

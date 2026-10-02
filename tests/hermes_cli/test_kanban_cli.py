@@ -237,7 +237,7 @@ def test_create_cli_wires_explicit_review_requirement(kanban_home):
         "--review-required --review-owner techlead"
     )
     task_id = re.search(r"(t_[a-f0-9]+)", output).group(1)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).review_requirement == {
             "required": True,
             "owner": "techlead",
