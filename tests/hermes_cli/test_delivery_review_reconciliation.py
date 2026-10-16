@@ -907,3 +907,23 @@ def test_finished_card_without_review_requirement_is_not_a_hold(conn):
     holds = {tid for tid, _ in tick(conn, max_spawn=0).delivery_holds}
     assert done_id not in holds
     assert review_id in holds
+
+
+@pytest.mark.parametrize("author,ok", [("meghann", True), ("Brett", True), ("pr-reviewer", False),
+                                       ("integrator", False), ("orchestrator", False)])
+def test_successor_receipt_human_approver_when_owner_is_reviewer(conn, author, ok):
+    """Owner == reviewer profile made every receipt fail; a named human approver may sign."""
+    from hermes_cli import kanban_review_reconcile as rr
+    parent, child = pair(conn)
+    req = {"required": True, "owner": "pr-reviewer", "review_task_id": child}
+    with kanban_db_connect.write_txn(conn):
+        conn.execute("UPDATE tasks SET review_requirement=? WHERE id=?", (json.dumps(req), parent))
+    prior = {"head": A, "evidence": {"artifact": "https://github.com/example/collector/pull/1"}}
+    succ = "https://github.com/example/collector/pull/2"
+    receipt = {"implementation_task": parent, "review_task": child, "previous_artifact": prior["evidence"]["artifact"],
+               "previous_head": A, "merged": True, "merge_commit": "c" * 40, "merge_verified_at": "2026-10-16T19:29:21Z",
+               "merge_source": prior["evidence"]["artifact"], "artifact": succ, "head": B}
+    cid = kb.add_comment(conn, parent, author=author, body=json.dumps({"delivery_artifact_successor": receipt}))
+    rows = {r["id"]: r for r in conn.execute("SELECT * FROM tasks WHERE id IN (?,?)", (parent, child))}
+    assert rr._authorized_successor(conn, rows[parent], rows[child], prior,
+                                    {"successor_authorization_comment": cid}, succ, B) is ok

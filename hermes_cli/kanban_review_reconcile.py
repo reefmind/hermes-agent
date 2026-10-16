@@ -11,6 +11,10 @@ import time
 
 from hermes_cli import kanban_db as kb
 
+# Humans who may post a merged-successor receipt (see _authorized_successor).
+# Brett and Meghann are the only Kanban approvers.
+HUMAN_APPROVERS = frozenset({"brett", "meghann"})
+
 
 def _object(value):
     if isinstance(value, str):
@@ -153,7 +157,13 @@ def _authorized_successor(conn, parent, child, previous, evidence, identity, hea
     comment = conn.execute("SELECT author, body FROM task_comments WHERE task_id=? AND id=?",
                            (parent["id"], comment_id)).fetchone()
     owner = _object(parent["review_requirement"]).get("owner")
-    if not comment or comment["author"] != owner or owner in {parent["assignee"], child["assignee"]}:
+    workers = {parent["assignee"], child["assignee"]}
+    # When the pair owner IS the reviewer profile (the common pr-reviewer setup)
+    # no owner receipt can ever be independent of both workers, so the gate was
+    # unsatisfiable. A named human approver is the independent authority then.
+    author = (comment["author"] or "").strip().lower() if comment else ""
+    allowed = ({owner} - workers) | (HUMAN_APPROVERS - workers)
+    if not comment or author not in allowed:
         return False
     receipt = _object(_object(comment["body"]).get("delivery_artifact_successor"))
     prior = _object(previous.get("evidence"))
