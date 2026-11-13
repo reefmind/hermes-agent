@@ -1161,7 +1161,7 @@ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> t
     return model, provider
 
 
-def _remap_retired_assignee(assignee: Optional[str]) -> tuple:
+def _remap_retired_assignee(assignee: Optional[str], *, independent_review: bool = False) -> tuple:
     """``(effective_assignee, retired_from)`` for a possibly-retired profile.
 
     ONE-CARD: roles that only made sense when work was split across cards cannot
@@ -1170,6 +1170,12 @@ def _remap_retired_assignee(assignee: Optional[str]) -> tuple:
     is how this came back. Unknown config or a missing key is a no-op.
     """
     if not assignee:
+        return assignee, None
+    if independent_review:
+        # A bound independent-review child must stay on its review owner: remapping
+        # pr-reviewer -> frontend hands the review to the implementer's own profile,
+        # which the reconciler rightly refuses ("sole independent review child"),
+        # deadlocking implement (review) <-> review (todo) forever (INT-4530).
         return assignee, None
     try:
         from hermes_cli.config import load_config_readonly as _lcr
@@ -1373,6 +1379,7 @@ def create_task(
     review_requirement: Optional[Mapping[str, Any]] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    independent_review: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1431,7 +1438,7 @@ def create_task(
     # orchestrator that fans out into children -- can no longer carry a card to
     # completion. Assigning one is a deadlock, so remap it at creation and say so
     # in the card's own event log. Config: kanban.retired_assignees.
-    assignee, _retired_from = _remap_retired_assignee(assignee)
+    assignee, _retired_from = _remap_retired_assignee(assignee, independent_review=independent_review)
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1708,13 +1715,32 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def _is_bound_review_child(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when a parent's review_requirement names *task_id* as its review child."""
+    try:
+        rows = conn.execute(
+            "SELECT p.review_requirement FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.review_requirement IS NOT NULL", (task_id,)).fetchall()
+    except sqlite3.Error:
+        return False
+    for (raw,) in rows:
+        try:
+            req = json.loads(raw) if isinstance(raw, str) else {}
+        except (TypeError, ValueError):
+            continue
+        if isinstance(req, dict) and req.get("review_task_id") == task_id:
+            return True
+    return False
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
     # ONE-CARD: reassignment is the second door. create_task was guarded and this
     # was not, so `hermes kanban assign <id> pr-reviewer` and the dashboard's
     # reassign control could still park a card on a profile that cannot finish it.
-    profile, _retired_from = _remap_retired_assignee(profile)
+    profile, _retired_from = _remap_retired_assignee(
+        profile, independent_review=_is_bound_review_child(conn, task_id))
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)

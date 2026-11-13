@@ -227,7 +227,7 @@ def _create_review_child(conn, parent, requirement, head, rid):
               "metadata with head, verdict PASS/BLOCK, and findings."),
         assignee=owner, created_by="delivery-review", parents=[tid], tenant=parent["tenant"],
         workspace_kind=parent["workspace_kind"], workspace_path=parent["workspace_path"],
-        idempotency_key=f"delivery-review:{tid}:{head}")
+        idempotency_key=f"delivery-review:{tid}:{head}", independent_review=True)
     bound = {**requirement, "review_task_id": child_id}
     conn.execute("UPDATE tasks SET review_requirement=? WHERE id=?",
                  (json.dumps(bound, sort_keys=True), tid))
