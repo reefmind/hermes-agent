@@ -453,7 +453,22 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        # The instantiation epoch must match exactly (a reboot changes it), but the start time is
+        # compared with the shared drift tolerance: macOS ``kern.boottime`` adjustments shift psutil
+        # create_time by ~1 s between spawn and a later read (#117505), and an exact string compare
+        # made live workers read as recycled -> "pid not alive" crash + SIGTERM mid-run (INT-4530).
+        from gateway.status import start_time_fingerprints_match
+        current = _process_fingerprint(int(pid))
+        if current is None:
+            return True
+        rec_epoch, _, rec_start = started_at.partition("|")
+        cur_epoch, _, cur_start = current.partition("|")
+        if rec_epoch != cur_epoch:
+            return True
+        try:
+            return not start_time_fingerprints_match(rec_start, cur_start)
+        except (TypeError, ValueError):
+            return True
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
@@ -1272,26 +1287,65 @@ def _reclassify_quota_clean_exit(dead: "_DeadWorker", task_id: str) -> "_DeadWor
     )
 
 
+# Pause between the two liveness reads that must BOTH say "dead" before a crash is booked. Capped
+# by the crash grace, so ``HERMES_KANBAN_CRASH_GRACE_SECONDS=0`` (tests) re-reads immediately.
+CRASH_RECHECK_SECONDS = 1.0
+
+
+def _confirmed_dead_workers(conn: sqlite3.Connection) -> set:
+    """``(task_id, worker_pid, claim_lock)`` of host-local running tasks whose worker is dead on two
+    liveness reads taken ``CRASH_RECHECK_SECONDS`` apart, outside the launch grace.
+
+    The grace runs from the CURRENT run's start (``task_runs.started_at`` of ``current_run_id``), not
+    ``tasks.started_at``: that is the card's first-ever start, so every retry/unblock got zero grace
+    and a worker still exec'ing read as dead. A single negative read never books a crash: one
+    transient probe failure (darwin ``ps`` rc, start-time read mid-exec) blocked live workers that
+    then kept running orphaned beside the blocked card, holding host_cap."""
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.claim_lock, "
+        "       COALESCE(r.started_at, t.started_at) AS run_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
+    ).fetchall()
+    host_prefix = _kb._host_prefix()
+    grace = _kb._resolve_crash_grace_seconds()
+    suspects = []
+    for row in rows:
+        if not (row["claim_lock"] or "").startswith(host_prefix):
+            continue
+        run_started_at = _kb._row_get(row, "run_started_at")
+        if run_started_at is not None and time.time() - run_started_at < grace:
+            continue
+        if not _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+            suspects.append(row)
+    if not suspects:
+        return set()
+    delay = min(CRASH_RECHECK_SECONDS, max(grace, 0))
+    if delay > 0:
+        time.sleep(delay)
+    return {
+        (row["id"], int(row["worker_pid"]), row["claim_lock"])
+        for row in suspects
+        if not _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at"))
+    }
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
+    # Liveness is decided BEFORE the write transaction (the recheck sleeps); the UPDATE below is
+    # guarded on (worker_pid, claim_lock), so a row that changed in between is simply skipped.
+    confirmed = _confirmed_dead_workers(conn)
+    if not confirmed:
+        return sweep
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
-        host_prefix = _kb._host_prefix()
         for row in rows:
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
-            started_at = _kb._row_get(row, "started_at")
-            if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
-                continue
-            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+            if (row["id"], int(row["worker_pid"]), row["claim_lock"]) not in confirmed:
                 continue
 
             pid = int(row["worker_pid"])

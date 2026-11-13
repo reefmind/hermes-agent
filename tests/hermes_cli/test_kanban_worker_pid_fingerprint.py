@@ -149,3 +149,34 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def test_start_time_drift_within_tolerance_is_still_our_worker(board):
+    """macOS shifts psutil create_time ~1 s between spawn and a later read; a live worker whose
+    composite fingerprint drifted by 1 s must stay alive, not read as recycled ("pid N not alive")."""
+    epoch, _, start = kbd._process_fingerprint(os.getpid()).partition("|")
+    drifted = f"{epoch}|{int(start) - 100}"
+    assert kbd._worker_alive(os.getpid(), drifted) is True
+
+
+def test_launch_grace_runs_from_the_current_run_not_the_first_start(board, monkeypatch):
+    """A retried card's ``tasks.started_at`` is its first-ever start; the grace must come from the
+    current run, so a just-respawned worker is not reclaimed before it is visible."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "30")
+    conn = board
+    tid = _claimed_running(conn, pid=os.getpid(), started_at=1)  # reads as dead
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                     (int(time.time()), tid))
+    kbd._reclaim_dead_workers(conn)
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_one_negative_liveness_read_does_not_book_a_crash(board, monkeypatch):
+    """A single transient "dead" read followed by a live re-read leaves the card running."""
+    conn = board
+    tid = _claimed_running(conn, pid=os.getpid(), started_at=1)
+    reads = iter([False, True])
+    monkeypatch.setattr(kbd, "_worker_alive", lambda pid, fp: next(reads))
+    kbd._reclaim_dead_workers(conn)
+    assert kb.get_task(conn, tid).status == "running"
