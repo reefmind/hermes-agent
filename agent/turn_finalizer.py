@@ -63,6 +63,11 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db_dispatch as _kbd
         _conn = _kbc.connect()
         try:
+            # One bounded auto-continue when the worker left a handoff comment.
+            if _kbd.continue_after_budget(
+                _conn, kanban_task, used=api_call_count, maximum=max_iterations,
+            ):
+                return
             _kbd._record_task_failure(
                 _conn,
                 kanban_task,

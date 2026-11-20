@@ -1096,6 +1096,16 @@ def _handle_request_review(args: dict, **kw) -> str:
                 f"kanban_request_review with the same handoff.")
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
+        # The handoff itself creates the one independent exact-head review
+        # card; a failure here never undoes the (already committed) handoff.
+        review_task = None
+        try:
+            from hermes_cli import kanban_review_auto
+            review_task = kanban_review_auto.on_handoff(conn, tid)
+        except Exception:
+            logger.warning("auto review card for %s failed", tid, exc_info=True)
+        if review_task:
+            return _ok_landed(kb, conn, tid, "review", review_task=review_task)
         return _ok_landed(kb, conn, tid, "review")
 
 

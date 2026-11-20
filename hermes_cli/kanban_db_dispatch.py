@@ -1563,6 +1563,61 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     return sweep.crashed
 
 
+def continue_after_budget(
+    conn: sqlite3.Connection, task_id: str, *, used: int, maximum: int,
+) -> bool:
+    """Requeue a budget-exhausted worker ONCE per card when it saved progress.
+
+    "Saved progress" is provenance, not prose: a comment on the card written
+    after this run's claim (the budget warning tells the worker to leave one).
+    The run closes as ``budget_continued`` without moving the failure counter;
+    the card returns to its source phase with a ``budget_auto_continued``
+    event, which also authorizes one respawn past the active-PR guard. A
+    second exhaustion on the same card falls through to the normal
+    ``timed_out`` failure path. Returns True when the card was continued.
+    """
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] is None:
+            return False
+        run_id = int(row["current_run_id"])
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'budget_auto_continued' LIMIT 1",
+            (task_id,),
+        ).fetchone():
+            return False
+        claimed = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+            (task_id, run_id),
+        ).fetchone()[0]
+        profile = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        # The worker's OWN comment; an operator comment is not saved progress.
+        if claimed is None or not profile or not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ? "
+            "AND json_valid(payload) AND json_extract(payload, '$.author') = ? LIMIT 1",
+            (task_id, claimed, profile["profile"]),
+        ).fetchone():
+            return False
+        status = _kb._retry_status_for_run(conn, task_id, run_id)
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL WHERE id = ? AND status = 'running'",
+            (status, task_id),
+        )
+        _kb._end_run(
+            conn, task_id, outcome="budget_continued", status="budget_continued",
+            summary=f"Iteration budget exhausted ({used}/{maximum}); progress saved, continuing once",
+        )
+        _kb._append_event(conn, task_id, "budget_auto_continued", {
+            "status": status, "budget_used": used, "budget_max": maximum,
+        }, run_id=run_id)
+    return True
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1751,6 +1806,7 @@ _EXPLICIT_REQUEUE_KINDS = (
     "status", "promoted_manual", "unblocked", "reclaimed",
     "changes_requested", "review_reopened",
     "delivery_changes_requested", "delivery_review_enqueued",
+    "budget_auto_continued",
 )
 
 
@@ -1762,6 +1818,8 @@ def _is_explicit_requeue(event: sqlite3.Row) -> bool:
     if not isinstance(payload, dict):
         return False
     kind = event["kind"]
+    if kind == "budget_auto_continued":
+        return bool(event["run_id"])
     if kind in {"delivery_changes_requested", "delivery_review_enqueued"}:
         return bool(event["run_id"] and payload.get("transition") and payload.get("head"))
     if kind == "reclaimed":
@@ -2883,6 +2941,15 @@ def _dispatch_once_locked(
     )
     from hermes_cli.kanban_review_reconcile import reconcile
     managed_review_parents, result.delivery_holds = reconcile(conn)
+    if not dry_run:
+        # Plain-handoff auto review verdicts and merged/closed PR cleanup.
+        # Bounded GitHub reads; a failure never stops the tick.
+        try:
+            from hermes_cli import kanban_review_auto
+            kanban_review_auto.tick(conn)
+        except Exception:
+            __import__("logging").getLogger(__name__).warning(
+                "kanban dispatcher: auto-review pass failed", exc_info=True)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
