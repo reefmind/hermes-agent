@@ -440,10 +440,15 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
-    return not _pid_recycled(pid, started_at)
+    # The PID exists. Only a fingerprint that was READ and DIFFERS proves a
+    # recycle; a start time that cannot be read right now (psutil/sysctl hiccup,
+    # mid-exec) proves nothing, and treating it as "dead" booked crashes on
+    # workers that were still running. Signalling stays strict: the kill paths
+    # call ``_pid_recycled`` directly and still refuse an unreadable fingerprint.
+    return not _pid_recycled(pid, started_at, unreadable_is_live=True)
 
 
-def _pid_recycled(pid: Optional[int], started_at) -> bool:
+def _pid_recycled(pid: Optional[int], started_at, *, unreadable_is_live: bool = False) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
     recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
@@ -460,7 +465,7 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
         from gateway.status import start_time_fingerprints_match
         current = _process_fingerprint(int(pid))
         if current is None:
-            return True
+            return not unreadable_is_live
         rec_epoch, _, rec_start = started_at.partition("|")
         cur_epoch, _, cur_start = current.partition("|")
         if rec_epoch != cur_epoch:
@@ -472,7 +477,7 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
-        return True
+        return not unreadable_is_live
     try:
         return not _start_times_agree(current, started_at)
     except (TypeError, ValueError):
@@ -1191,6 +1196,10 @@ def _classify_dead_worker_exit(
     if code is not None and kind != "unknown":
         event_payload["exit_kind"] = kind
         event_payload["exit_code"] = code
+    # Say what is actually known, so a real crash reads differently from a
+    # worker that merely vanished: ``exit_observed`` means an exit status was
+    # reaped or logged; without one the process is gone but nothing recorded why.
+    event_payload["exit_observed"] = kind != "unknown"
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
@@ -1250,7 +1259,12 @@ def _rate_limit_reset_seconds(task_id: str) -> Optional[int]:
     """``resets_in_seconds`` from the worker log tail, or None. BLOCK-CONTRACT-QUOTA-RESET-DEF"""
     import glob as _glob
     paths = [str(_kb.worker_logs_dir() / f"{task_id}.log")]
-    paths += _glob.glob(os.path.expanduser(f"~/.hermes/kanban/boards/*/logs/{task_id}.log"))
+    # Same root as ``_rate_limit_signature_in_log``: the active Hermes home's
+    # boards, not a hardcoded ``~/.hermes`` (wrong under a relocated home).
+    try:
+        paths += _glob.glob(str(_kb.boards_root() / "*" / "logs" / f"{task_id}.log"))
+    except Exception:
+        pass
     for path in paths:
         try:
             with open(path, "rb") as fh:
@@ -1267,9 +1281,21 @@ def _rate_limit_reset_seconds(task_id: str) -> Optional[int]:
 
 
 def _reclassify_quota_clean_exit(dead: "_DeadWorker", task_id: str) -> "_DeadWorker":
-    if not dead.protocol_violation:
+    if dead.rate_limited or dead.terminal_provider:
         return dead
-    signature = _rate_limit_signature_in_log(task_id)
+    if dead.protocol_violation:
+        signature = _rate_limit_signature_in_log(task_id)
+    elif dead.kind in ("unknown", "nonzero_exit"):
+        # A quota wall does not always end the worker cleanly: the CLI lane dies
+        # non-zero (or unreaped, "pid N not alive") seconds after start with the
+        # provider's refusal as its last words. That was booked as a crash and
+        # operator-held, indistinguishable from a real crash. Only THIS run's own
+        # final output counts here -- an old quota line further up the shared log
+        # must not turn a genuine crash into a silent requeue.
+        hit = _QUOTA_LOG_RE.search(str(dead.event_payload.get("worker_output") or ""))
+        signature = f"provider quota: {hit.group(0)}" if hit else None
+    else:
+        signature = None
     if not signature:
         return dead
     pid = dead.event_payload.get("pid")

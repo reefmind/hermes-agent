@@ -180,3 +180,36 @@ def test_one_negative_liveness_read_does_not_book_a_crash(board, monkeypatch):
     monkeypatch.setattr(kbd, "_worker_alive", lambda pid, fp: next(reads))
     kbd._reclaim_dead_workers(conn)
     assert kb.get_task(conn, tid).status == "running"
+
+
+def test_live_pid_with_unreadable_start_time_is_not_booked_dead(board, monkeypatch):
+    """The PID exists but its start time cannot be read right now: that proves nothing about a
+    recycle, so the worker stays alive. The kill path still refuses to signal it."""
+    recorded = kbd._process_fingerprint(os.getpid())
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
+    assert kbd._worker_alive(os.getpid(), recorded) is True
+    assert kbd._pid_recycled(os.getpid(), recorded) is True
+
+
+def _dead(kind, output, **flags):
+    payload = {"pid": 4242, "claimer": "host:1"}
+    if output:
+        payload["worker_output"] = output
+    return kbd._DeadWorker(kind, 1, "pid 4242 not alive", "crashed", payload, **flags)
+
+
+def test_quota_wall_in_the_dead_workers_final_output_requeues_instead_of_crashing(board):
+    """A worker that died right after the provider refused it for quota is a rate-limited requeue."""
+    dead = kbd._reclassify_quota_clean_exit(
+        _dead("unknown", "This request would exceed your account's rate limit. Please try again later."), "t_x")
+    assert dead.rate_limited is True and dead.run_outcome == "rate_limited"
+
+
+def test_dead_worker_without_quota_output_stays_a_crash(board):
+    dead = kbd._reclassify_quota_clean_exit(_dead("unknown", "Traceback: KeyError 'x'"), "t_x")
+    assert dead.rate_limited is False and dead.run_outcome == "crashed"
+
+
+def test_signal_killed_worker_is_never_reclassified_as_quota(board):
+    dead = kbd._reclassify_quota_clean_exit(_dead("signaled", "rate limit"), "t_x")
+    assert dead.run_outcome == "crashed"
